@@ -12,8 +12,16 @@ _state = {"server": None, "dsn": None, "dir": None}
 
 def _server_dsn() -> str:
     if _state["dsn"] is None:
-        import pixeltable_pgserver as pgserver
+        import os
         from src.orders.pg_store import migrate
+        # CI uses ONE database kind: the postgres:16 SERVICE CONTAINER (TRACK_A_TEST_PG_DSN).
+        # Local development without that variable falls back to the embedded PG 16 server.
+        env_dsn = os.environ.get("TRACK_A_TEST_PG_DSN")
+        if env_dsn:
+            _state["dsn"] = env_dsn
+            migrate(env_dsn)
+            return env_dsn
+        import pixeltable_pgserver as pgserver
         _state["dir"] = tempfile.mkdtemp(prefix="pgtest_")
         _state["server"] = pgserver.get_server(_state["dir"], cleanup_mode="stop")
         _state["dsn"] = _state["server"].get_uri()

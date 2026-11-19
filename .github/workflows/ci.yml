@@ -1,0 +1,78 @@
+# CI database decision (single, explicit): GitHub Actions uses the postgres:16 SERVICE CONTAINER,
+# selected via TRACK_A_TEST_PG_DSN. The embedded PostgreSQL (pixeltable-pgserver) is only the
+# local-development fallback used when that variable is unset. CI never uses the embedded server.
+#
+# NOTE: this workflow has not been executed yet (needs a push to GitHub). Do not treat it as a
+# passing CI run until the Actions log + artifact exist for a specific commit SHA.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  TRACK_A_TEST_PG_DSN: postgresql://postgres:postgres@localhost:5432/postgres
+  PYTHONUTF8: "1"
+
+jobs:
+  tests:
+    name: pytest (PostgreSQL 16 service container)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: python -m pip install -r requirements.txt
+      - name: Run full test suite
+        run: |
+          mkdir -p artifacts
+          echo "$GITHUB_SHA" > artifacts/commit-sha.txt
+          python -m pytest -q -p no:cacheprovider --junitxml=artifacts/junit.xml tests 2>&1 | tee artifacts/pytest.log
+          exit ${PIPESTATUS[0]}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pytest-evidence-${{ github.sha }}
+          path: artifacts/
+
+  lock-mutation:
+    name: lock / guard mutation check (separate job)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: python -m pip install -r requirements.txt
+      - name: Baseline must pass; every weakened protection must make its race test FAIL
+        run: python tools/mutation_check.py --out mutation-evidence
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-evidence-${{ github.sha }}
+          path: mutation-evidence/

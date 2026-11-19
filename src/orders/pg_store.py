@@ -19,6 +19,7 @@ protection-order (SL/TP) uncertainty state.
 from __future__ import annotations
 
 import hashlib
+import os
 import pathlib
 import uuid
 from contextlib import contextmanager
@@ -35,7 +36,9 @@ from src.orders.errors import (
     StaleClaim,
 )
 
-MIGRATIONS_DIR = pathlib.Path(__file__).parent / "migrations"
+# TRACK_A_MIGRATIONS_DIR is for the CI mutation check ONLY (applies deliberately weakened SQL).
+MIGRATIONS_DIR = pathlib.Path(os.environ.get("TRACK_A_MIGRATIONS_DIR")
+                              or pathlib.Path(__file__).parent / "migrations")
 
 # The entry gate (advisory lock + entry_control singleton) is GLOBAL to the database: the schema
 # has no account_id. Correct ONLY for a single trading account. Multi-account support needs an
