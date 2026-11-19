@@ -2,8 +2,9 @@
 # selected via TRACK_A_TEST_PG_DSN. The embedded PostgreSQL (pixeltable-pgserver) is only the
 # local-development fallback used when that variable is unset. CI never uses the embedded server.
 #
-# NOTE: this workflow has not been executed yet (needs a push to GitHub). Do not treat it as a
-# passing CI run until the Actions log + artifact exist for a specific commit SHA.
+# Status: run 44541334075 on commit 628e64efafe4cefb500379282d755e918ec4c3a7 passed BOTH jobs below
+# (pytest on the service container, and the separate mutation check). That proves the offline test suite
+# only - NOT that any live exchange connection works (CI never opens real exchange connections).
 name: ci
 
 on:
