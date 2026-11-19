@@ -77,6 +77,8 @@ class OrderIntent:
     claim_token: Optional[str]
     exchange_order_id: Optional[str]
     last_error: Optional[str]
+    exchange_status: Optional[str] = None   # exchange LIFECYCLE (separate from `state`)
+    filled_qty: float = 0.0                  # cumulative filled quantity
 
 
 def _intent(r: dict) -> OrderIntent:
@@ -84,7 +86,8 @@ def _intent(r: dict) -> OrderIntent:
         r["intent_id"], r["authorization_id"], r["client_order_id"], r["purpose"], r["symbol"],
         r["side"], r["order_type"], float(r["quantity"]),
         None if r["price"] is None else float(r["price"]), r["reduce_only"],
-        IntentState(r["state"]), r["claim_token"], r["exchange_order_id"], r["last_error"])
+        IntentState(r["state"]), r["claim_token"], r["exchange_order_id"], r["last_error"],
+        r.get("exchange_status"), float(r.get("filled_qty") or 0))
 
 
 def client_order_id_for(authorization_id: str) -> str:
@@ -300,6 +303,69 @@ class OrderStore:
                 self._event(c, r["intent_id"], "SUBMIT_PENDING", "SUBMISSION_UNKNOWN",
                             "recovered: claim holder gone; outcome unknown")
             return [_intent(r) for r in rows]
+
+    # ---- exchange lifecycle + fills (P1-1) --------------------------------
+    TERMINAL_STATUSES = frozenset({"FILLED", "CANCELED", "EXPIRED", "REJECTED"})
+
+    def record_lifecycle(self, intent_id: int, exchange_status: Optional[str] = None,
+                         cumulative_qty: Optional[float] = None,
+                         fills: Optional[List[dict]] = None) -> dict:
+        """Record exchange lifecycle status + fills for an intent, IDEMPOTENTLY and MONOTONICALLY.
+
+        * fills: [{"fill_id", "qty", "price"}]; (intent, fill_id) is UNIQUE so a re-delivered fill
+          is ignored (no double count).
+        * filled_qty = max(existing, sum(distinct fills), reported cumulative): never decreases,
+          so a stale/late report cannot erase a fill.
+        * A terminal status (FILLED/CANCELED/EXPIRED/REJECTED) is never reverted by a stale
+          non-terminal report.
+        Does NOT touch `state` (submission result) and takes no entry-gate lock.
+        Returns {"filled_qty", "exchange_status", "new_fills", "flags": [...]}."""
+        flags: List[str] = []
+        with self._tx() as c:
+            row = c.execute("SELECT * FROM order_intents WHERE intent_id=%s FOR UPDATE",
+                            (intent_id,)).fetchone()
+            if row is None:
+                raise IllegalTransition(f"unknown intent {intent_id}")
+            new_fills = 0
+            for f in fills or []:
+                cur = c.execute(
+                    "INSERT INTO order_fills(intent_id, exchange_fill_id, qty, price)"
+                    " VALUES (%s,%s,%s,%s) ON CONFLICT (intent_id, exchange_fill_id) DO NOTHING",
+                    (intent_id, str(f["fill_id"]), f["qty"], f.get("price")))
+                new_fills += cur.rowcount
+            fsum = float(c.execute("SELECT COALESCE(sum(qty),0) AS s FROM order_fills"
+                                   " WHERE intent_id=%s", (intent_id,)).fetchone()["s"])
+            old_filled = float(row["filled_qty"])
+            filled = max(old_filled, fsum, float(cumulative_qty or 0.0))
+            qty = float(row["quantity"])
+            status = exchange_status or row["exchange_status"]
+            if row["exchange_status"] in self.TERMINAL_STATUSES and status not in self.TERMINAL_STATUSES:
+                status = row["exchange_status"]            # ignore stale non-terminal report
+            if filled > qty * (1 + 1e-9):
+                flags.append("OVERFILL")
+            if row["state"] == "REJECTED" and filled > 0:
+                flags.append("FILL_ON_REJECTED")
+            if status == "FILLED" and filled < qty * (1 - 1e-9):
+                flags.append("FILLED_STATUS_QTY_MISMATCH")
+            if cumulative_qty is not None and fsum > 0 and float(cumulative_qty) + 1e-9 < fsum:
+                flags.append("CUMULATIVE_BELOW_FILL_SUM")
+            c.execute("UPDATE order_intents SET exchange_status=%s, filled_qty=%s,"
+                      " lifecycle_updated_at=now(), updated_at=now() WHERE intent_id=%s",
+                      (status, filled, intent_id))
+            if filled != old_filled or status != row["exchange_status"] or flags:
+                self._event(c, intent_id, None, None,
+                            f"lifecycle status={status} filled={filled} new_fills={new_fills}"
+                            + (f" FLAGS={','.join(flags)}" if flags else ""))
+            return {"filled_qty": filled, "exchange_status": status, "new_fills": new_fills,
+                    "flags": flags}
+
+    def list_lifecycle_open(self) -> List[OrderIntent]:
+        """ACCEPTED intents whose exchange lifecycle is not known to be terminal."""
+        with self._tx() as c:
+            return [_intent(r) for r in c.execute(
+                "SELECT * FROM order_intents WHERE state='ACCEPTED' AND"
+                " (exchange_status IS NULL OR exchange_status NOT IN"
+                " ('FILLED','CANCELED','EXPIRED','REJECTED')) ORDER BY intent_id")]
 
     # ---- persistent entry freeze ----------------------------------------
     def freeze_entries(self, reason: str) -> None:

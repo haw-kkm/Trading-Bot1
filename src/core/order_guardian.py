@@ -59,6 +59,7 @@ class Order:
     events: List[str] = field(default_factory=list)
     rejection_reason: Optional[str] = None
     validated_order: Optional[ValidatedOrder] = None
+    seen_fill_ids: set = field(default_factory=set)   # idempotency for re-delivered fills
 
 
 class OrderGuardian:
@@ -263,7 +264,8 @@ class OrderGuardian:
 
         return {"status": "REJECTED", "reason": f"Cannot confirm cancel in state {order.state.value}"}
 
-    def handle_fill(self, order_id: str, filled_quantity: float, fill_price: float) -> Dict[str, Any]:
+    def handle_fill(self, order_id: str, filled_quantity: float, fill_price: float,
+                    fill_id: Optional[str] = None) -> Dict[str, Any]:
         """Handle order fill: FILLED/PARTIALLY_FILLED with race condition resolution.
 
         Race Resolution Rule: If order is in PENDING_CANCEL and fill arrives,
@@ -277,8 +279,11 @@ class OrderGuardian:
 
         Args:
             order_id: Order ID
-            filled_quantity: Quantity filled
+            filled_quantity: Quantity filled (THIS fill only, not cumulative)
             fill_price: Fill price
+            fill_id: exchange fill/trade id. When given, a re-delivered fill is ignored so the
+                quantity / position is never double counted. Without it, duplicates cannot be
+                detected (callers on a re-delivering channel MUST pass it).
 
         Returns:
             Dict with fill result and position processing status
@@ -287,6 +292,12 @@ class OrderGuardian:
             order = self.orders.get(order_id)
             if not order:
                 return {"status": "REJECTED", "reason": "Order not found"}
+
+            if fill_id is not None:
+                if fill_id in order.seen_fill_ids:
+                    return {"status": "DUPLICATE_FILL_IGNORED", "position_processed": False,
+                            "filled_quantity": order.filled_quantity}
+                order.seen_fill_ids.add(fill_id)
 
             # Check if this is a race condition (fill while in PENDING_CANCEL)
             race_condition = (order.state == OrderState.PENDING_CANCEL)

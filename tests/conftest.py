@@ -24,7 +24,7 @@ def _server_dsn() -> str:
 def _reset_tables(dsn: str) -> None:
     import psycopg
     with psycopg.connect(dsn, autocommit=True) as c:
-        c.execute("TRUNCATE order_events, order_intents, authorizations RESTART IDENTITY CASCADE")
+        c.execute("TRUNCATE order_fills, order_events, order_intents, authorizations RESTART IDENTITY CASCADE")
         c.execute("TRUNCATE account_equity")
         c.execute("UPDATE entry_control SET frozen=FALSE, reason=NULL, frozen_at=NULL WHERE id=1")
 

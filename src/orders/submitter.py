@@ -22,8 +22,44 @@ from src.orders.errors import (
 )
 from src.orders.pg_store import IntentState, OrderIntent, OrderStore
 
-ACCEPTED_STATUSES = {"NEW", "PARTIALLY_FILLED", "FILLED"}
-REJECTED_STATUSES = {"REJECTED", "CANCELED", "EXPIRED"}
+# P1-1: submission result (intent.state) and exchange lifecycle (exchange_status) are SEPARATE.
+# Any status below proves the exchange ACCEPTED the order at some point. CANCELED/EXPIRED are
+# lifecycle outcomes of an accepted order (possibly with a partial fill), NOT rejections.
+# Vocabulary / field names are an ASSUMED contract: Toobit's real format is UNVERIFIED.
+LIFECYCLE_STATUSES = {"NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED"}
+QTY_REQUIRED_STATUSES = {"PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED"}
+_TOL = 1e-9
+
+
+@dataclass(frozen=True)
+class Evidence:
+    state: IntentState                 # submission result proven by the exchange response
+    order_id: str
+    exchange_status: str
+    executed_qty: Optional[float]
+    fills: List[dict]
+
+
+def _lifecycle_fields(resp: Any):
+    """(status, executed_qty, fills) from a response, tolerating absence; None if unparseable."""
+    if not isinstance(resp, dict):
+        return None
+    status = str(resp.get("status", "")).upper() or None
+    executed = resp.get("executedQty")
+    try:
+        executed = None if executed is None else float(executed)
+    except (TypeError, ValueError):
+        return None
+    if executed is not None and executed < 0:
+        return None
+    fills = []
+    for f in resp.get("fills") or []:
+        try:
+            fills.append({"fill_id": str(f["fillId"]), "qty": float(f["qty"]),
+                          "price": None if f.get("price") is None else float(f["price"])})
+        except (KeyError, TypeError, ValueError):
+            return None
+    return status, executed, fills
 
 
 def default_ack_validator(resp: Any, intent: OrderIntent) -> bool:
@@ -102,6 +138,8 @@ class SafeSubmitter:
         try:
             resp = self.sender(intent)
             if self.ack_validator(resp, intent):
+                # An unclear / non-matching response is NEVER treated as accepted or rejected:
+                # the ack validator is the only way to ACCEPTED, everything else is UNKNOWN.
                 new, kw = IntentState.ACCEPTED, dict(
                     exchange_order_id=str(resp["orderId"]) if resp.get("orderId") else None,
                     note="exchange ack")
@@ -116,11 +154,27 @@ class SafeSubmitter:
                 last_error=f"{type(exc).__name__}: {exc}"[:300], note="submit outcome unknown")
         try:
             done = self.store.record_outcome(intent.intent_id, intent.claim_token, new, **kw)
+            if done.state == IntentState.ACCEPTED:
+                self._apply_ack_lifecycle(done, resp)
+                done = self.store.get(done.intent_id)
             return SubmissionResult(done, done.state, resp)
         except (StaleClaim, psycopg.Error):
             # Outcome not recorded: row is SUBMIT_PENDING (or already recovered to UNKNOWN).
             # Either way it is treated as unknown and is never resent.
             return SubmissionResult(intent, IntentState.SUBMISSION_UNKNOWN, resp, recorded=False)
+
+    def _apply_ack_lifecycle(self, intent: OrderIntent, resp: Any) -> None:
+        """If the submit ACK itself carries lifecycle/fill info, persist it (best effort: the
+        order is already durably ACCEPTED, so a failure here must not change that)."""
+        lf = _lifecycle_fields(resp)
+        if lf is None:
+            return
+        status, executed, fills = lf
+        if status in LIFECYCLE_STATUSES and (executed is not None or fills or status == "NEW"):
+            try:
+                self.store.record_lifecycle(intent.intent_id, status, executed, fills)
+            except Exception as exc:
+                self.store.record_note(intent.intent_id, f"ack lifecycle not recorded: {exc!r}"[:300])
 
     # ---- recovery / reconcile (never sends) ------------------------------
     def recover_on_startup(self, lease_s: float = 0.0) -> List[OrderIntent]:
@@ -130,6 +184,8 @@ class SafeSubmitter:
         return self.store.list_by_state(IntentState.INTENT_PERSISTED)
 
     def reconcile(self, intent_id: int) -> OrderIntent:
+        """Resolve a SUBMISSION_UNKNOWN intent by QUERY only. Lifecycle (CANCELED/EXPIRED) and
+        fills found on the way are recorded separately from the submission result."""
         intent = self.store.get(intent_id)
         if intent.state != IntentState.SUBMISSION_UNKNOWN or self.query is None:
             return intent
@@ -138,19 +194,44 @@ class SafeSubmitter:
         except Exception as exc:
             self.store.record_note(intent_id, f"reconcile query failed: {type(exc).__name__}")
             return intent
-        verdict = self._evidence(resp, intent)
-        if verdict is None:
+        ev = self._evidence(resp, intent)
+        if ev is None:
             self.store.record_note(intent_id, f"reconcile inconclusive: {resp!r}"[:300])
             return intent
-        new, order_id = verdict
         try:
-            return self.store.resolve_unknown(
-                intent_id, new, evidence=f"exchange query: {resp!r}"[:500], exchange_order_id=order_id)
+            self.store.resolve_unknown(
+                intent_id, ev.state, evidence=f"exchange query: {resp!r}"[:500],
+                exchange_order_id=ev.order_id)
         except IllegalTransition:
-            return self.store.get(intent_id)
+            pass                                    # resolved concurrently; still record lifecycle
+        self.store.record_lifecycle(intent_id, ev.exchange_status, ev.executed_qty, ev.fills)
+        return self.store.get(intent_id)
+
+    def refresh_lifecycle(self, intent_id: int) -> OrderIntent:
+        """For an ACCEPTED intent: re-query and record lifecycle + fills (also AFTER
+        CANCELED/EXPIRED, so a partial fill that preceded the cancel is reflected)."""
+        intent = self.store.get(intent_id)
+        if intent.state != IntentState.ACCEPTED or self.query is None:
+            return intent
+        try:
+            resp = self.query(intent.client_order_id)
+        except Exception as exc:
+            self.store.record_note(intent_id, f"lifecycle query failed: {type(exc).__name__}")
+            return intent
+        ev = self._evidence(resp, intent)
+        if ev is None or ev.state != IntentState.ACCEPTED:
+            self.store.record_note(intent_id, f"lifecycle refresh inconclusive: {resp!r}"[:300])
+            return intent
+        self.store.record_lifecycle(intent_id, ev.exchange_status, ev.executed_qty, ev.fills)
+        return self.store.get(intent_id)
+
+    def refresh_all_lifecycles(self) -> List[OrderIntent]:
+        return [self.refresh_lifecycle(i.intent_id) for i in self.store.list_lifecycle_open()]
 
     @staticmethod
-    def _evidence(resp: Any, intent: OrderIntent) -> Optional[tuple]:
+    def _evidence(resp: Any, intent: OrderIntent) -> Optional[Evidence]:
+        """Strict: identity fields must match OURS; anything ambiguous => None (stay UNKNOWN).
+        REJECTED is concluded ONLY for an explicit REJECTED status with executedQty == 0."""
         if not isinstance(resp, dict) or not resp:
             return None
         if any(not resp.get(k) for k in ("clientOrderId", "orderId", "status", "symbol", "side")):
@@ -164,12 +245,30 @@ class SafeSubmitter:
                     return None
             except (TypeError, ValueError):
                 return None
-        status = str(resp["status"]).upper()
-        if status in ACCEPTED_STATUSES:
-            return IntentState.ACCEPTED, str(resp["orderId"])
-        if status in REJECTED_STATUSES:
-            return IntentState.REJECTED, str(resp["orderId"])
-        return None
+        lf = _lifecycle_fields(resp)
+        if lf is None:
+            return None
+        status, executed, fills = lf
+        order_id = str(resp["orderId"])
+        fsum = sum(f["qty"] for f in fills)
+        if executed is not None and fsum > executed + _TOL:
+            return None                              # fills exceed cumulative: inconsistent
+        eff = executed if executed is not None else (fsum if fills else None)
+        if status == "REJECTED":
+            if eff is not None and eff == 0 and executed is not None:
+                return Evidence(IntentState.REJECTED, order_id, "REJECTED", 0.0, fills)
+            return None                              # REJECTED with fills / unknown qty: conflict
+        if status not in LIFECYCLE_STATUSES:
+            return None
+        if status in QTY_REQUIRED_STATUSES and executed is None:
+            return None                              # no cumulative qty: cannot rule out fills
+        if executed is not None and executed > intent.quantity * (1 + _TOL):
+            return None
+        if status == "FILLED" and executed is not None and executed < intent.quantity * (1 - _TOL):
+            return None
+        if status == "PARTIALLY_FILLED" and executed is not None and executed <= 0:
+            return None
+        return Evidence(IntentState.ACCEPTED, order_id, status, executed, fills)
 
     def reconcile_all(self) -> List[OrderIntent]:
         return [self.reconcile(i.intent_id)
