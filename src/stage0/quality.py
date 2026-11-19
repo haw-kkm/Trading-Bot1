@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import Enum
+from collections import Counter, OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 from .envelope import EventType, MarketEnvelope, Source
@@ -55,6 +56,26 @@ SLOW_MAX_AGE = {"OPEN_INTEREST": timedelta(seconds=180), "LONG_SHORT_RATIO": tim
                 "SERVER_TIME": timedelta(minutes=10)}
 
 
+class _SeqWindow:
+    """Bounded duplicate-detection memory: remembers the newest `cap` sequence ids (insertion order, FIFO eviction).
+    A duplicate is detected exactly while its id is still inside the window; an id older than `cap` newer ids
+    would be accepted again (documented trade-off for bounded memory)."""
+
+    def __init__(self, cap: int):
+        self.cap, self._d = cap, OrderedDict()
+
+    def __contains__(self, k):
+        return k in self._d
+
+    def add(self, k):
+        self._d[k] = None
+        while len(self._d) > self.cap:
+            self._d.popitem(last=False)
+
+    def __len__(self):
+        return len(self._d)
+
+
 class DataQualityGate:
     """Freshness is tracked PER (source, symbol, event type). A consumer states which types it needs;
     READY requires every one of them to be present, fresh, timestamp-sane and verified."""
@@ -62,12 +83,15 @@ class DataQualityGate:
     def __init__(self, max_age: timedelta = timedelta(seconds=10),
                  max_receive_lag: timedelta = timedelta(seconds=5),
                  max_pair_skew: timedelta = timedelta(seconds=2),
-                 divergence_pct: Decimal = Decimal("0.5")):
+                 divergence_pct: Decimal = Decimal("0.5"), max_seq_history: int = 100_000,
+                 max_issues: int = 10_000):
         self.max_age, self.max_receive_lag = max_age, max_receive_lag
         self.max_pair_skew, self.divergence_pct = max_pair_skew, divergence_pct
-        self.issues: List[Issue] = []
+        self.issues: List[Issue] = []                       # newest `max_issues` only (bounded)
+        self.issue_counts: Counter = Counter()              # exact totals by kind, never evicted
+        self.max_issues, self.max_seq_history = max_issues, max_seq_history
         self._last: Dict[Tuple, MarketEnvelope] = {}        # (source,symbol,type) -> last accepted
-        self._seen_seq: Dict[Tuple, set] = {}
+        self._seen_seq: Dict[Tuple, _SeqWindow] = {}
         self._type_rx: Dict[Tuple, datetime] = {}           # (source,symbol,type) -> last GOOD received_at
         self._seen_types: Dict[Tuple, set] = {}             # (source,symbol) -> types ever seen
         self._bad_ts: Dict[Tuple, str] = {}                 # (source,symbol,type) -> reason (future / lag)
@@ -81,6 +105,14 @@ class DataQualityGate:
     def _issue(self, kind, env_or_src, symbol="", detail=""):
         src = env_or_src.source.value if isinstance(env_or_src, MarketEnvelope) else str(env_or_src)
         self.issues.append(Issue(kind, src, symbol, detail))
+        self.issue_counts[kind] += 1
+        if len(self.issues) > self.max_issues:
+            del self.issues[: len(self.issues) - self.max_issues]
+
+    def is_current(self, env: MarketEnvelope) -> bool:
+        """True only if `env` is the event the gate accepted as the latest state of its type (i.e. it passed
+        every check: not BACKFILL, not duplicate, not out of order, sane timestamp, not crossed)."""
+        return self._last.get((env.source.value, env.symbol, env.event_type.value)) is env
 
     def kinds(self):
         return [i.kind for i in self.issues]
@@ -161,7 +193,7 @@ class DataQualityGate:
             self._bad_ts[key] = "future event time" if "FUTURE_EVENT_TIME" in env.quality_flags else "receive lag"
             return found
         if env.sequence_id is not None and env.event_type != EventType.ORDERBOOK_SNAPSHOT:
-            seen = self._seen_seq.setdefault(key, set())
+            seen = self._seen_seq.setdefault(key, _SeqWindow(self.max_seq_history))
             if env.sequence_id in seen:
                 flag("DUPLICATE_EVENT", env.sequence_id)
                 return found                       # a duplicate must not update state

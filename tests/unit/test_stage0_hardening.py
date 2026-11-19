@@ -330,6 +330,9 @@ class StubRunner:
     def health(self, stall):
         return StubRunner.health_result
 
+    def stream_report(self, end=None):
+        return {"window_start": None, "window_end": None, "window_s": None, "by_type": {}}
+
 
 @pytest.mark.parametrize("outcome,code", [(None, 0), (StartupFailure("t"), 3), (ReconnectExhausted("x"), 4),
                                           (live.ResyncExhausted("gap"), 5), (FatalDataError("x"), 5),

@@ -8,3 +8,9 @@ artifacts/
 .env
 .env.*
 !.env.example
+
+# local market-data evidence from new runs must never be committed by accident
+# (files already tracked stay tracked; ignoring does not untrack them)
+stage0-binance-local/
+stage0-toobit-local/
+stage0-live-evidence/
