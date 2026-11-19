@@ -16,6 +16,8 @@ import subprocess
 import sys
 
 SOURCES = {
+    "binance-spot": ("BTCUSDT", ["--allow-binance-network"],
+                     ("TRADE", "BOOK_TICKER", "ORDERBOOK_DELTA")),
     "binance-futures": ("BTCUSDT", ["--allow-binance-network"],
                         ("TRADE", "BOOK_TICKER", "ORDERBOOK_DELTA", "MARK_PRICE")),
     "toobit-futures": ("BTC-SWAP-USDT", ["--allow-toobit-network", "--i-approve-toobit-public-readonly"],
@@ -63,8 +65,8 @@ def stream_evidence(jsonl: Path, source: str):
                 if not isinstance(raw, dict):
                     raw = {}
                 counts[kind] += 1
-                if source == "binance-futures":
-                    # REST only fetches depth snapshots, OI/funding/ratio.
+                if source in ("binance-spot", "binance-futures"):
+                    # Binance REST only fetches reference data (no live trade/ticker/delta).
                     if kind in ("TRADE", "BOOK_TICKER", "ORDERBOOK_DELTA", "MARK_PRICE"):
                         websocket[kind] += 1
                 else:
@@ -124,7 +126,7 @@ def main(argv=None):
         p.error("--seconds must be 15..120")
     logdir = Path(args.output_dir)
     logdir.mkdir(parents=True, exist_ok=True)
-    sources = ["binance-futures"]
+    sources = ["binance-spot", "binance-futures"]
     if not args.binance_only and args.approve_toobit_public_readonly:
         sources.append("toobit-futures")
     records = [verify(s, logdir, args.seconds, args.timeout_seconds) for s in sources]
