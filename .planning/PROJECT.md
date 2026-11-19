@@ -58,3 +58,6 @@ This document evolves at phase transitions and milestone boundaries.
 2. Core Value check — still the right priority?
 3. Audit Out of Scope — reasons still valid?
 4. Update Context with current state
+
+## Stage 0 status (see docs/plans/stage0-data.md)
+Stage 0 data layer implemented in Python (src/stage0) with fixture-based tests; DATA-01..05 are implemented for FIXTURE mode only. No live data was collected; Toobit shapes unverified. Not wired to order execution.

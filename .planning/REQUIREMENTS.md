@@ -72,3 +72,5 @@
 ---
 *Requirements defined: 2026-11-19*
 *Last updated: 2026-11-19 after detailed prompt integration*
+## Status note
+DATA-01..05: code + fixture tests exist (src/stage0); live verification NOT done; Toobit (DATA-03) parsers unverified. Boxes above intentionally left unchecked until live verification.

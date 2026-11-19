@@ -87,3 +87,6 @@ When an order fills on Toobit but immediate server-side SL/TP registration fails
 2. **RiskEngine Determinism**: 100% of test cases with excessive leverage are rejected, and excessive position sizes are clamped deterministically.
 3. **Race Condition Resilience**: Simulated simultaneous cancel and fill events correctly resolve to fill state without duplicate order submission or unhandled exceptions.
 4. **Emergency Rollback Safety**: Simulated SL/TP registration failures successfully trigger entry freeze, retry/IOC fallback, position reconciliation, and panic state locking.
+
+## Stage 0 status (see docs/plans/stage0-data.md)
+Stage 0 data layer implemented in Python (src/stage0) with fixture-based tests; DATA-01..05 are implemented for FIXTURE mode only. No live data was collected; Toobit shapes unverified. Not wired to order execution.

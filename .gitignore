@@ -4,3 +4,7 @@ __pycache__/
 graphify-out/
 mutation-evidence/
 artifacts/
+
+.env
+.env.*
+!.env.example

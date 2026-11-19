@@ -58,3 +58,6 @@
 | 2. Core Execution Engine & Deterministic Risk Guardrails | 0/0 | Not started | - |
 | 3. Parallel Data Agents & Live Integration | 0/0 | Not started | - |
 | 4. Adversarial Analysis, LLM Decision Making & End-to-End Paper Trading | 0/0 | Not started | - |
+
+## Stage 0 status (see docs/plans/stage0-data.md)
+Stage 0 data layer implemented in Python (src/stage0) with fixture-based tests; DATA-01..05 are implemented for FIXTURE mode only. No live data was collected; Toobit shapes unverified. Not wired to order execution.
