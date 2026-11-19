@@ -1,0 +1,4 @@
+psycopg[binary]>=3.2
+pytest>=8
+# test-only: embedded PostgreSQL 16 server for the real-DB tests (production uses PostgreSQL 16)
+pixeltable-pgserver>=0.7

@@ -255,6 +255,8 @@ def test_integration_sl_tp_failure_emergency_liquidation():
 
 # Mock Toobit Client for testing
 class MockToobitClient:
+    is_simulated = True  # mock: allowed while live trading is disabled
+
     def __init__(self, sl_tp_fail=False, sl_tp_fail_count=0, ioc_fill=True, extreme_conditions=False):
         self.sl_tp_fail = sl_tp_fail
         self.sl_tp_fail_count = sl_tp_fail_count
@@ -269,16 +271,16 @@ class MockToobitClient:
             return {"status": "FAILED", "error": "SL/TP registration failed"}
         return {"status": "SUCCESS", "sl_registered": True, "tp_registered": True}
 
-    def execute_reduce_only_order(self, symbol, side, quantity, price, order_type="LIMIT"):
+    def execute_reduce_only_order(self, symbol, side, quantity, price, order_type="LIMIT", client_order_id=None):
         return {"status": "SUCCESS", "reduce_only": True, "order_type": order_type}
 
-    def execute_ioc_order(self, symbol, side, quantity, price):
+    def execute_ioc_order(self, symbol, side, quantity, price, client_order_id=None):
         if self.ioc_fill:
             self.position_size = 0.0
             return {"status": "SUCCESS", "time_in_force": "IOC", "order_type": "LIMIT", "fill_status": "FILLED"}
         return {"status": "SUCCESS", "time_in_force": "IOC", "order_type": "LIMIT", "fill_status": "UNFILLED"}
 
-    def execute_market_order(self, symbol, side, quantity):
+    def execute_market_order(self, symbol, side, quantity, client_order_id=None):
         self.position_size = 0.0
         return {"status": "SUCCESS", "order_type": "MARKET"}
 

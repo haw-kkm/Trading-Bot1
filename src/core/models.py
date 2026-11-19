@@ -214,11 +214,14 @@ class ValidatedOrder:
     status: str              # "APPROVED" or "CLAMPED"
     original_quantity: float
     signature: str
+    # Unique per issued token (signed). Local one-time-use key; NOT an exchange
+    # exactly-once guarantee. Default "" keeps legacy/forged constructions valid.
+    authorization_id: str = ""
 
     @staticmethod
     def canonical_payload(
         symbol, side, quantity, leverage, price, stop_loss, take_profit,
-        hypothesis_id, status, original_quantity,
+        hypothesis_id, status, original_quantity, authorization_id="",
     ) -> bytes:
         """Canonical byte form of the execution-critical fields (to be MAC'd).
 
@@ -237,6 +240,7 @@ class ValidatedOrder:
                 "hypothesis_id": hypothesis_id,
                 "status": status,
                 "original_quantity": original_quantity,
+                "authorization_id": authorization_id,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -247,5 +251,5 @@ class ValidatedOrder:
         return self.canonical_payload(
             self.symbol, self.side, self.quantity, self.leverage, self.price,
             self.stop_loss, self.take_profit, self.hypothesis_id, self.status,
-            self.original_quantity,
+            self.original_quantity, self.authorization_id,
         )

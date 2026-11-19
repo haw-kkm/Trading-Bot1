@@ -16,6 +16,8 @@ from src.core.risk_engine import RiskEngine
 
 
 class RecordingClient:
+    is_simulated = True  # mock: allowed while live trading is disabled
+
     """Mock Toobit client that records every call it receives."""
 
     def __init__(self, sl_tp_ok=True, raise_on=None):
@@ -32,17 +34,17 @@ class RecordingClient:
         self._maybe_raise("register_sl_tp")
         return {"status": "SUCCESS" if self.sl_tp_ok else "FAILED"}
 
-    def execute_reduce_only_order(self, symbol, side, quantity, price, order_type="LIMIT"):
+    def execute_reduce_only_order(self, symbol, side, quantity, price, order_type="LIMIT", client_order_id=None):
         self.calls.append(("reduce_only", symbol, side, quantity, price))
         self._maybe_raise("execute_reduce_only_order")
         return {"status": "SUCCESS"}
 
-    def execute_ioc_order(self, symbol, side, quantity, price):
+    def execute_ioc_order(self, symbol, side, quantity, price, client_order_id=None):
         self.calls.append(("ioc", symbol, side, quantity, price))
         self._maybe_raise("execute_ioc_order")
         return {"status": "SUCCESS", "fill_status": "FILLED"}
 
-    def execute_market_order(self, symbol, side, quantity):
+    def execute_market_order(self, symbol, side, quantity, client_order_id=None):
         self.calls.append(("market", symbol, side, quantity))
         self._maybe_raise("execute_market_order")
         return {"status": "SUCCESS"}
@@ -223,14 +225,19 @@ def test_client_none_does_not_die_silently():
     assert engine.emergency_lock == EmergencyLockState.LOCKED
 
 
-def test_execute_client_exception_returns_rejected_and_rolls_back():
+def test_execute_client_exception_is_submission_unknown_not_rollback():
+    """Req: an API timeout/connection error is NOT a failure. No rollback, no resend,
+    new entries frozen, outcome persisted as SUBMISSION_UNKNOWN."""
     token = RiskEngine().validate_trade(_hypothesis())["validated_order"]
     engine = ExecutionEngine()
-    engine.toobit_client = RecordingClient(raise_on={"execute_market_order", "register_sl_tp"})
+    client = RecordingClient(raise_on={"execute_market_order", "register_sl_tp"})
+    engine.toobit_client = client
     result = engine.execute_market_order("BTCUSDT", "BUY", 0.1, validated_order=token)
-    assert result["status"] == "REJECTED"
-    assert engine.rollback_calls == 1
+    assert result["status"] == "SUBMISSION_UNKNOWN"
+    assert getattr(engine, "rollback_calls", 0) == 0
     assert engine.new_entry_blocked is True
+    assert [c[0] for c in client.calls] == ["market"]  # sent exactly once, nothing else
+    assert engine.order_store.has_unresolved_unknown()
 
 
 def test_rollback_itself_never_raises_when_client_missing():
@@ -280,12 +287,9 @@ def test_signature_is_hmac_bound_to_secret_key(monkeypatch):
     assert RiskEngine.verify_token(token) is False
 
 
-def test_market_order_rollback_uses_token_price():
-    token = RiskEngine().validate_trade(_hypothesis(price=42000.0))["validated_order"]
+def test_emergency_rollback_uses_caller_price_via_persisted_intent():
     engine = ExecutionEngine()
-    engine.toobit_client = RecordingClient(raise_on={"execute_market_order", "register_sl_tp"})
-    seen = []
-    orig = engine.trigger_emergency_rollback
-    engine.trigger_emergency_rollback = lambda *a: (seen.append(a), orig(*a))[1]
-    engine.execute_market_order("BTCUSDT", "BUY", 0.1, validated_order=token)
-    assert seen and seen[0][3] == 42000.0
+    engine.toobit_client = RecordingClient(sl_tp_ok=False)
+    engine.trigger_emergency_rollback("BTCUSDT", "BUY", 0.1, 42000.0)
+    ioc = [c for c in engine.toobit_client.calls if c[0] == "ioc"]
+    assert ioc and ioc[0][4] == 42000.0

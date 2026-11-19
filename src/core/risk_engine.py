@@ -9,6 +9,7 @@ import hmac
 import json
 import os
 import secrets
+import uuid
 from typing import Dict, Any, Tuple
 from src.core.models import TradeHypothesis, ValidatedOrder
 
@@ -145,6 +146,7 @@ class RiskEngine:
                 hypothesis_id=hypothesis.hypothesis_id,
                 status=decision_result["status"],
                 original_quantity=hypothesis.quantity,
+                authorization_id=uuid.uuid4().hex,
             )
             token = ValidatedOrder(
                 **fields,

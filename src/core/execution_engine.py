@@ -7,10 +7,18 @@ and SL/TP automation on Toobit, including the Hybrid Emergency Rollback Protocol
 import json
 import os
 import time
+import uuid
 from enum import Enum
 from typing import Dict, Any, Optional
 from src.core.models import ValidatedOrder
 from src.core.risk_engine import RiskEngine
+from src.orders.errors import (
+    ActiveEmergencyOrderExists, AuthorizationAlreadyConsumed, ExchangeRejected,  # noqa: F401
+    PersistenceFailed, PolicyViolation,
+)
+from src.orders.pg_store import IntentState
+from src.orders.policy import ExecutionContext, OrderPurpose, check_policy
+from src.orders.submitter import SafeSubmitter
 
 
 class UnauthorizedExecutionError(Exception):
@@ -37,12 +45,26 @@ class ExecutionEngine:
     Rollback workflow to ensure fail-safe position management.
     """
 
-    def __init__(self):
-        """Initialize ExecutionEngine with config."""
+    # Test/bootstrap hook only: callable returning an OrderStore for engines built without one.
+    default_store_factory = None
+
+    def __init__(self, order_store=None, live_trading_enabled: bool = False):
+        """Initialize ExecutionEngine with config.
+
+        live_trading_enabled stays False until live order placement is separately approved.
+        """
         self.state = ExecutionState.READY
         self.emergency_lock = EmergencyLockState.UNLOCKED
         self.new_entry_blocked = False
         self.toobit_client = None
+        self.live_trading_enabled = live_trading_enabled
+        self.order_store = None
+        self.submitter = None
+        self._emergency_episodes: Dict[str, str] = {}
+        if order_store is None and ExecutionEngine.default_store_factory is not None:
+            order_store = ExecutionEngine.default_store_factory()
+        if order_store is not None:
+            self.attach_order_store(order_store)
 
         # Load risk limits config
         self._load_config()
@@ -69,6 +91,85 @@ class ExecutionEngine:
                 "execution refused: missing or invalid ValidatedOrder token"
             )
 
+    # ------------------------------------------------------------------
+    # Order submission. ExecutionEngine owns ONLY the exchange API calls
+    # (_exchange_send/_exchange_query). Persistence, one-time authorization,
+    # submit authority and SUBMISSION_UNKNOWN handling live in OrderStore/SafeSubmitter.
+    # ------------------------------------------------------------------
+    def attach_order_store(self, store) -> None:
+        self.order_store = store
+        self.submitter = SafeSubmitter(store, self._exchange_send, self._exchange_query)
+
+    def _exchange_send(self, intent) -> Any:
+        """The one place that calls the exchange to place an order. Raises ExchangeRejected only
+        for a definitive refusal; any other exception is treated as an unknown outcome."""
+        client = self.toobit_client
+        cid = intent.client_order_id
+        if intent.order_type == "MARKET":
+            return client.execute_market_order(
+                intent.symbol, intent.side, intent.quantity, client_order_id=cid)
+        if intent.order_type == "IOC":
+            return client.execute_ioc_order(
+                intent.symbol, intent.side, intent.quantity, intent.price, client_order_id=cid)
+        return client.execute_reduce_only_order(
+            intent.symbol, intent.side, intent.quantity, intent.price,
+            order_type="LIMIT", client_order_id=cid)
+
+    def _exchange_query(self, client_order_id: str) -> Any:
+        return self.toobit_client.query_order(client_order_id)
+
+    def _live_gate(self) -> Optional[str]:
+        """Live order placement stays disabled until separately approved. Simulated/mock
+        clients (is_simulated=True) are allowed."""
+        if self.live_trading_enabled or getattr(self.toobit_client, "is_simulated", False):
+            return None
+        return "live trading disabled (requires separate approval)"
+
+    def _submit_order(self, purpose: OrderPurpose, order_type: str, symbol: str, side: str,
+                      quantity: float, price: Optional[float], authorization_id: str,
+                      token_ok: bool) -> Dict[str, Any]:
+        """Common pipeline for EVERY order purpose. Returns a status dict; never raises for
+        policy/persistence problems and never sends anything unless the intent was durably
+        persisted and submit authority acquired first."""
+        reduce_only = purpose != OrderPurpose.ENTRY
+        if self.order_store is None or self.submitter is None:
+            return {"status": "REJECTED", "reason": "order store not configured (fail closed)"}
+        gate = self._live_gate()
+        if gate:
+            return {"status": "REJECTED", "reason": gate}
+        ctx = ExecutionContext(self.emergency_lock == EmergencyLockState.LOCKED,
+                               self.new_entry_blocked)
+        try:
+            check_policy(purpose, reduce_only, token_ok, ctx)
+        except PolicyViolation as exc:
+            return {"status": "REJECTED", "reason": str(exc)}
+        try:
+            self.order_store.issue_authorization(
+                authorization_id, purpose.value, symbol, side, order_type, quantity, price,
+                reduce_only)
+            res = self.submitter.submit(authorization_id)
+        except (AuthorizationAlreadyConsumed, ActiveEmergencyOrderExists) as exc:
+            return {"status": "DUPLICATE_SUPPRESSED", "reason": f"duplicate order suppressed: {exc!r}"}
+        except PersistenceFailed as exc:
+            return {"status": "REJECTED", "reason": f"persistence failed, nothing sent: {exc}"}
+        except Exception as exc:  # e.g. issue_authorization DB failure: still pre-send
+            return {"status": "REJECTED", "reason": f"persistence failed, nothing sent: {exc}"}
+        base = {"intent_id": res.intent.intent_id, "client_order_id": res.intent.client_order_id,
+                "response": res.response}
+        if res.state == IntentState.ACCEPTED:
+            return {"status": "SUCCESS", **base}
+        if res.state == IntentState.REJECTED:
+            return {"status": "REJECTED", "reason": f"exchange rejected: {res.intent.last_error}", **base}
+        # SUBMISSION_UNKNOWN: do NOT roll back, do NOT resend; freeze new entries until reconciled.
+        self.new_entry_blocked = True
+        return {"status": "SUBMISSION_UNKNOWN",
+                "reason": "submit outcome unknown; reconcile via query before any further action",
+                **base}
+
+    @staticmethod
+    def _auth_id(validated_order: ValidatedOrder) -> str:
+        return validated_order.authorization_id or f"sig:{validated_order.signature}"
+
     def execute_reduce_only_order(
         self,
         symbol: str,
@@ -77,39 +178,14 @@ class ExecutionEngine:
         price: float,
         validated_order: Optional[ValidatedOrder] = None,
     ) -> Dict[str, Any]:
-        """Execute a reduce-only order on Toobit.
-
-        Args:
-            symbol: Trading symbol
-            side: Order side (BUY/SELL)
-            quantity: Order quantity
-            price: Order price
-            validated_order: ValidatedOrder token issued by RiskEngine.
-                If None, execution is REJECTED (bypass block at source).
-
-        Returns:
-            Dict with execution result
-        """
-        if self.emergency_lock == EmergencyLockState.LOCKED:
-            return {"status": "REJECTED", "reason": "emergency lock"}
-
+        """Reduce-only (EXIT) order. Allowed during emergency lock (risk reduction)."""
         self._require_token(validated_order)
         quantity = validated_order.quantity  # clamped quantity is authoritative
-
-        try:
-            result = self.toobit_client.execute_reduce_only_order(symbol, side, quantity, price, order_type="LIMIT")
-            return {
-                "status": "SUCCESS",
-                "reduce_only": True,
-                "order_type": "LIMIT",
-            }
-        except Exception as exc:
-            rollback = self.trigger_emergency_rollback(symbol, side, quantity, price)
-            return {
-                "status": "REJECTED",
-                "reason": f"execution failed: {exc}",
-                "rollback": rollback,
-            }
+        out = self._submit_order(OrderPurpose.EXIT, "LIMIT", symbol, side, quantity, price,
+                                 self._auth_id(validated_order), True)
+        if out["status"] == "SUCCESS":
+            out.update({"reduce_only": True, "order_type": "LIMIT"})
+        return out
 
     def execute_ioc_order(
         self,
@@ -119,39 +195,14 @@ class ExecutionEngine:
         price: float,
         validated_order: Optional[ValidatedOrder] = None,
     ) -> Dict[str, Any]:
-        """Execute an IOC (Immediate or Cancel) order on Toobit.
-
-        Args:
-            symbol: Trading symbol
-            side: Order side (BUY/SELL)
-            quantity: Order quantity
-            price: Order price
-            validated_order: ValidatedOrder token issued by RiskEngine.
-                If None, execution is REJECTED (bypass block at source).
-
-        Returns:
-            Dict with execution result
-        """
-        if self.emergency_lock == EmergencyLockState.LOCKED:
-            return {"status": "REJECTED", "reason": "emergency lock"}
-
+        """IOC (ENTRY purpose). Refused during emergency lock / entry freeze."""
         self._require_token(validated_order)
-        quantity = validated_order.quantity  # clamped quantity is authoritative
-
-        try:
-            result = self.toobit_client.execute_ioc_order(symbol, side, quantity, price)
-            return {
-                "status": "SUCCESS",
-                "time_in_force": "IOC",
-                "order_type": "LIMIT"
-            }
-        except Exception as exc:
-            rollback = self.trigger_emergency_rollback(symbol, side, quantity, price)
-            return {
-                "status": "REJECTED",
-                "reason": f"execution failed: {exc}",
-                "rollback": rollback,
-            }
+        quantity = validated_order.quantity
+        out = self._submit_order(OrderPurpose.ENTRY, "IOC", symbol, side, quantity, price,
+                                 self._auth_id(validated_order), True)
+        if out["status"] == "SUCCESS":
+            out.update({"time_in_force": "IOC", "order_type": "LIMIT"})
+        return out
 
     def execute_market_order(
         self,
@@ -160,39 +211,16 @@ class ExecutionEngine:
         quantity: float,
         validated_order: Optional[ValidatedOrder] = None,
     ) -> Dict[str, Any]:
-        """Execute a market order on Toobit.
+        """Market (ENTRY purpose). Refused during emergency lock / entry freeze.
 
-        Args:
-            symbol: Trading symbol
-            side: Order side (BUY/SELL)
-            quantity: Order quantity
-            validated_order: ValidatedOrder token issued by RiskEngine.
-                If None, execution is REJECTED (bypass block at source).
-
-        Returns:
-            Dict with execution result
-        """
-        if self.emergency_lock == EmergencyLockState.LOCKED:
-            return {"status": "REJECTED", "reason": "emergency lock"}
-
+        An API timeout / lost response is SUBMISSION_UNKNOWN: no rollback, no resend."""
         self._require_token(validated_order)
-        quantity = validated_order.quantity  # clamped quantity is authoritative
-
-        try:
-            result = self.toobit_client.execute_market_order(symbol, side, quantity)
-            return {
-                "status": "SUCCESS",
-                "order_type": "MARKET"
-            }
-        except Exception as exc:
-            rollback = self.trigger_emergency_rollback(
-                symbol, side, quantity, validated_order.price
-            )
-            return {
-                "status": "REJECTED",
-                "reason": f"execution failed: {exc}",
-                "rollback": rollback,
-            }
+        quantity = validated_order.quantity
+        out = self._submit_order(OrderPurpose.ENTRY, "MARKET", symbol, side, quantity,
+                                 validated_order.price, self._auth_id(validated_order), True)
+        if out["status"] == "SUCCESS":
+            out["order_type"] = "MARKET"
+        return out
 
     def register_sl_tp(
         self,
@@ -287,12 +315,13 @@ class ExecutionEngine:
         sl_tp_retries_attempted = 0
         extreme_conditions_bypass = False
 
+        episode = self._emergency_episodes.setdefault(symbol, uuid.uuid4().hex)
+
         # Check for extreme conditions first
         if self.toobit_client.is_extreme_conditions():
             extreme_conditions_bypass = True
         else:
-            # 2. Conditional Retry & IOC Limit Exit
-            # Attempt up to max_sl_tp_retries (2 retries, so 3 total attempts)
+            # 2. Conditional Retry (SL/TP registration, not an order submission)
             for i in range(self.max_sl_tp_retries + 1):
                 sl_tp_retries_attempted += 1
                 result = self.toobit_client.register_sl_tp(symbol, side, quantity, price, 0, 0)
@@ -300,7 +329,6 @@ class ExecutionEngine:
                     sl_tp_registered = True
                     break
 
-        # If SL/TP registration succeeded
         if sl_tp_registered:
             self.enter_emergency_lock()
             return {
@@ -309,35 +337,48 @@ class ExecutionEngine:
                 "sl_tp_registered": True
             }
 
-        # 4. Extreme Conditions Bypass
+        # Emergency risk-reduction orders go through the common persisted pipeline.
+        # Deterministic authorization ids per (symbol, episode, step) + a DB partial unique
+        # index make duplicate emergency liquidation impossible.
         if extreme_conditions_bypass:
-            # Skip retries/IOC and execute immediate emergency market liquidation
-            self.toobit_client.execute_market_order(symbol, side, quantity)
+            out = self._emergency_reduce(symbol, side, quantity, price, "MARKET",
+                                         f"EMERG:{symbol}:{episode}:MARKET")
             self.enter_emergency_lock()
-            return {
-                "status": "ROLLBACK_COMPLETED",
-                "extreme_conditions_bypass": True,
-                "market_liquidation_executed": True
-            }
+            if out["status"] == "SUCCESS":
+                return {"status": "ROLLBACK_COMPLETED", "extreme_conditions_bypass": True,
+                        "market_liquidation_executed": True}
+            return self._rollback_not_completed(out)
 
-        # 2. IOC Limit Exit
-        ioc_result = self.toobit_client.execute_ioc_order(symbol, side, quantity, price)
+        ioc = self._emergency_reduce(symbol, side, quantity, price, "IOC",
+                                     f"EMERG:{symbol}:{episode}:IOC")
+        if ioc["status"] == "SUCCESS" and (ioc.get("response") or {}).get("fill_status") == "FILLED":
+            self.enter_emergency_lock()
+            return {"status": "ROLLBACK_COMPLETED", "ioc_exit_executed": True,
+                    "ioc_fill_status": "FILLED"}
+        if ioc["status"] != "SUCCESS":
+            # duplicate / unknown / rejected IOC: never fall through to a second order blindly
+            self.enter_emergency_lock()
+            return self._rollback_not_completed(ioc)
 
-        if ioc_result.get("fill_status") == "FILLED":
-            self.enter_emergency_lock()
-            return {
-                "status": "ROLLBACK_COMPLETED",
-                "ioc_exit_executed": True,
-                "ioc_fill_status": "FILLED"
-            }
-        else:
-            # 3. Market Close Fallback
-            self.toobit_client.execute_market_order(symbol, side, quantity)
-            self.enter_emergency_lock()
-            return {
-                "status": "ROLLBACK_COMPLETED",
-                "market_close_executed": True
-            }
+        # 3. Market Close Fallback (IOC accepted but unfilled)
+        mkt = self._emergency_reduce(symbol, side, quantity, price, "MARKET",
+                                     f"EMERG:{symbol}:{episode}:MARKET")
+        self.enter_emergency_lock()
+        if mkt["status"] == "SUCCESS":
+            return {"status": "ROLLBACK_COMPLETED", "market_close_executed": True}
+        return self._rollback_not_completed(mkt)
+
+    def _emergency_reduce(self, symbol, side, quantity, price, order_type, authorization_id):
+        return self._submit_order(OrderPurpose.EMERGENCY_REDUCE, order_type, symbol, side,
+                                  quantity, price, authorization_id, True)
+
+    @staticmethod
+    def _rollback_not_completed(out: Dict[str, Any]) -> Dict[str, Any]:
+        status = out["status"]
+        if status == "DUPLICATE_SUPPRESSED":
+            return {"status": "ROLLBACK_DUPLICATE_SUPPRESSED", "reason": out.get("reason")}
+        return {"status": "ROLLBACK_INCOMPLETE_LOCKED", "order_status": status,
+                "reason": out.get("reason")}
 
     def create_new_entry_order(self, symbol: str, side: str, quantity: float, price: float) -> Dict[str, Any]:
         """Create a new entry order (blocked during emergency rollback).
@@ -389,7 +430,11 @@ class ExecutionEngine:
         """
         position_size = self.reconcile_position("BTCUSDT")["position_size"]
 
+        if self.order_store is not None and self.order_store.has_unresolved_unknown():
+            return {"status": "FAILED", "reason": "unresolved SUBMISSION_UNKNOWN orders; reconcile first"}
+
         if position_size == 0.0:
+            self._emergency_episodes.clear()
             self.emergency_lock = EmergencyLockState.UNLOCKED
             self.state = ExecutionState.READY
             self.new_entry_blocked = False
