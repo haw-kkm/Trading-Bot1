@@ -34,6 +34,10 @@ from typing import Any, Dict, List
 from ..envelope import EnvelopeError, EventType, MarketEnvelope, Source, ms_to_utc, to_decimal
 from ..symbols import binance_to_common, toobit_to_common
 
+class SubscriptionError(EnvelopeError):
+    """The server answered a subscribe with an error object ({"code","desc"}), e.g. -100010 "Invalid Symbols!"."""
+
+
 DOC, UNVERIFIED = "DOC", "UNVERIFIED"
 DOC_DATE = "2026-11-20"
 DOC_URL = "https://api-docs.toobit.com/api/usdt-m-market-data.html"
@@ -56,11 +60,21 @@ def _flags(key: str):
     return ("UNVERIFIED_SCHEMA",) if VERIFICATION[key] == UNVERIFIED else ("DOC_ONLY",)
 
 
-def _env(key, sym, et, ms, rx, raw, norm, seq=None, common=None):
+def _env(key, sym, et, ms, rx, raw, norm, seq=None, common=None, extra_flags=()):
     return MarketEnvelope(source=Source.TOOBIT_FUTURES, symbol=common or toobit_to_common(sym),
                           exchange_symbol=sym, event_type=et, event_time=None if ms is None else ms_to_utc(ms),
                           received_at=rx, raw_payload=raw, normalized_payload=norm, sequence_id=seq,
-                          quality_flags=_flags(key))
+                          quality_flags=_flags(key) + tuple(extra_flags))
+
+
+def index_symbol(symbol: str) -> str:
+    """Index endpoints are keyed by the spot-style name (BTCUSDT), NOT BTC-SWAP-USDT.
+    OBSERVED 2026-11-19 (live): GET /quote/v1/index?symbol=BTC-SWAP-USDT -> {"index":{},"edp":{}} (empty);
+    ?symbol=BTCUSDT -> {"index":{"BTCUSDT":...},...}. WS topic "index" with BTC-SWAP-USDT -> code -100010."""
+    parts = symbol.split("-")
+    if len(parts) != 3 or parts[1] != "SWAP":
+        raise EnvelopeError(f"unrecognised Toobit symbol {symbol!r}")
+    return parts[0] + parts[2]
 
 
 def _need(d, *keys):
@@ -131,9 +145,9 @@ def parse_mark_price(rows, rx) -> List[MarketEnvelope]:
 
 def parse_index_price(r, rx) -> List[MarketEnvelope]:
     _need(r, "index")
-    if not isinstance(r["index"], dict) or not r["index"]:
-        raise EnvelopeError("index must be a non-empty {symbol: price} map")
-    out = []
+    if not isinstance(r["index"], dict):
+        raise EnvelopeError("index must be a {symbol: price} map")
+    out = []                  # an EMPTY map (wrong symbol form requested) yields no events: callers must treat as no data
     for sym, price in r["index"].items():
         norm = {"index_price": price}
         edp = r.get("edp", {})
@@ -197,6 +211,8 @@ def parse_ws(msg: Any, rx) -> List[MarketEnvelope]:
         raise EnvelopeError("Toobit WS message must be an object")
     if "pong" in msg or "ping" in msg:
         return []
+    if "code" in msg and "desc" in msg and "topic" not in msg:
+        raise SubscriptionError(f"server rejected the request: code={msg['code']} desc={msg['desc']}")
     _need(msg, "topic", "data")
     topic, wsym = msg["topic"], msg.get("symbol")
     items = _as_list(msg["data"], "data")
@@ -204,13 +220,21 @@ def parse_ws(msg: Any, rx) -> List[MarketEnvelope]:
     for d in items:
         if topic == "trade":
             _need(d, "t", "p", "q")
+            # OBSERVED live: the first push (f=true) replays the ~60 most recent trades (up to ~15 s old).
+            # They are history, not live data: flagged BACKFILL (no lag check, never counts as fresh).
+            backfill = ("BACKFILL",) if msg.get("f") is True else ()
             out.append(_env("ws_trade", wsym or d.get("s"), EventType.TRADE, d["t"], rx, d,
                             {"price": d["p"], "quantity": d["q"], "is_buy": d.get("m"), "first_push": msg.get("f")},
-                            seq=None if d.get("v") is None else str(d["v"])))
+                            seq=None if d.get("v") is None else str(d["v"]), extra_flags=backfill))
         elif topic == "markPrice":
-            _need(d, "symbol", "markPrice", "time")
-            out.append(_env("ws_mark_price", d["symbol"], EventType.MARK_PRICE, d["time"], rx, d,
-                            {"mark_price": d["markPrice"]}))
+            # OBSERVED live (2026-11-19): after an empty ack push (data: []), pushes carry a dict
+            # {"exchangeId","symbolId","price","time"} (REST-like) and no top-level "symbol". The docs
+            # describe {"symbol","markPrice","time"}; both are accepted, the observed one first.
+            sym = d.get("symbolId") or d.get("symbol") or wsym
+            price = d.get("price") if d.get("price") is not None else d.get("markPrice")
+            if sym is None or price is None or d.get("time") is None:
+                raise EnvelopeError("markPrice push without (symbolId|symbol), (price|markPrice) and time")
+            out.append(_env("ws_mark_price", sym, EventType.MARK_PRICE, d["time"], rx, d, {"mark_price": price}))
         elif topic == "index":
             _need(d, "symbol", "index")
             norm = {"index_price": d["index"]}
@@ -248,6 +272,8 @@ def ws_subscribe_message(topic: str, symbol: str, binary: bool = False) -> Dict[
     """Subscribe frame per docs: {"symbol","topic","event":"sub","params":{"binary":false}}."""
     if topic not in ("trade", "markPrice", "depth", "diffDepth", "bookTicker", "index") and not topic.startswith("kline_"):
         raise EnvelopeError(f"unsupported topic {topic!r}")
+    if topic == "index":
+        symbol = index_symbol(symbol)         # live: BTC-SWAP-USDT is rejected ("Invalid Symbols!") for this topic
     return {"symbol": symbol, "topic": topic, "event": "sub", "params": {"binary": binary}}
 
 

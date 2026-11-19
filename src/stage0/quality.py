@@ -150,7 +150,8 @@ class DataQualityGate:
 
         if "FUTURE_EVENT_TIME" in env.quality_flags:
             flag("FUTURE_EVENT_TIME", str(env.event_time))
-        lag = (env.event_type.value in LAG_CHECKED_TYPES and env.event_time is not None
+        backfill = "BACKFILL" in env.quality_flags      # replayed history (e.g. Toobit first trade push)
+        lag = (not backfill and env.event_type.value in LAG_CHECKED_TYPES and env.event_time is not None
                and env.received_at - env.event_time > self.max_receive_lag)
         if lag:
             flag("RECEIVE_LAG", str(env.received_at - env.event_time))
@@ -165,6 +166,8 @@ class DataQualityGate:
                 flag("DUPLICATE_EVENT", env.sequence_id)
                 return found                       # a duplicate must not update state
             seen.add(env.sequence_id)
+        if backfill:
+            return found          # recorded for de-duplication only: history is not evidence of live freshness
         prev = self._last.get(key)
         if prev is not None:
             if env.event_time and prev.event_time and env.event_time < prev.event_time:
@@ -212,7 +215,7 @@ class DataQualityGate:
             return Readiness.SYNCING
         if (src, symbol) in self._invalid:
             return Readiness.INVALID
-        need = sorted(wanted) if wanted is not None else sorted(self._seen_types.get((src, symbol), ()))
+        need = sorted(wanted) if wanted is not None else self._default_types(src, symbol)
         if not need:
             return Readiness.STALE                      # nothing ever received for this symbol
         for t in need:
@@ -226,10 +229,19 @@ class DataQualityGate:
                 return Readiness.STALE
         return Readiness.READY
 
+    def _default_types(self, src: str, symbol: str):
+        """Types a consumer implicitly depends on when it names none: everything seen, except that a REST
+        order-book snapshot which is followed by a delta stream is only BOOTSTRAP data (the delta stream and
+        the book state govern freshness). Snapshot-only feeds (e.g. Toobit partial depth) keep their snapshot."""
+        seen = set(self._seen_types.get((src, symbol), ()))
+        if "ORDERBOOK_DELTA" in seen:
+            seen.discard("ORDERBOOK_SNAPSHOT")
+        return sorted(seen)
+
     def explain(self, source: Source, symbol: str, now: datetime, types=None) -> Dict[str, str]:
         """Per-type diagnosis (MISSING / STALE / BAD_TIMESTAMP / UNVERIFIED / OK) for logs and reports."""
         src = source.value
-        need = sorted({getattr(t, "value", t) for t in types}) if types is not None else             sorted(self._seen_types.get((src, symbol), ()))
+        need = sorted({getattr(t, "value", t) for t in types}) if types is not None else             self._default_types(src, symbol)
         out = {}
         for t in need:
             k = (src, symbol, t)
