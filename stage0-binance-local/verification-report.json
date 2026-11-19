@@ -1,0 +1,391 @@
+{
+  "created_at_utc": "2026-11-19T20:46:32.285350+00:00",
+  "python": "3.14.5",
+  "verification_seconds": 30,
+  "trading_or_account_requests": false,
+  "tested_sources": [
+    "binance-spot",
+    "binance-futures"
+  ],
+  "overall": "PASS",
+  "results": [
+    {
+      "source": "binance-spot",
+      "symbol": "BTCUSDT",
+      "environment_blocked": false,
+      "blocked_reason": null,
+      "status": "PASS",
+      "stages": {
+        "rest": {
+          "status": "PASS",
+          "reason": "all endpoints PASS",
+          "endpoints": [
+            {
+              "endpoint": "/api/v3/time",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": [
+                "serverTime"
+              ],
+              "extra_keys": [],
+              "missing_keys": [],
+              "clock_offset_ms": -133,
+              "reason": "serverTime present and plausible"
+            },
+            {
+              "endpoint": "/api/v3/ticker/price",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": [
+                "price",
+                "symbol"
+              ],
+              "extra_keys": [],
+              "missing_keys": [],
+              "parsed_events": 1,
+              "structure": "PASS",
+              "reason": "structure matches parser; values not independently verified"
+            },
+            {
+              "endpoint": "/api/v3/depth",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": [
+                "asks",
+                "bids",
+                "lastUpdateId"
+              ],
+              "extra_keys": [],
+              "missing_keys": [],
+              "parsed_events": 1,
+              "structure": "PASS",
+              "reason": "structure matches parser; values not independently verified"
+            }
+          ]
+        },
+        "ws_received": {
+          "status": "PASS",
+          "reason": "all required types received over WebSocket",
+          "counts": {
+            "ORDERBOOK_DELTA": 295,
+            "BOOK_TICKER": 10275,
+            "TRADE": 2544
+          }
+        },
+        "ws_parsed": {
+          "status": "PASS",
+          "reason": "13115 parsed, 0 rejected"
+        },
+        "ws_fresh": {
+          "status": "PASS",
+          "reason": "largest gap between messages 0.7s (limit 20.0s)"
+        },
+        "gate_ready": {
+          "status": "PASS",
+          "reason": "core types ['TRADE', 'BOOK_TICKER'] READY at end of data",
+          "per_type": {
+            "BOOK_TICKER": "OK",
+            "ORDERBOOK_DELTA": "OK",
+            "TRADE": "OK"
+          }
+        }
+      },
+      "rest_check_run": {
+        "command": "C:\\vscode\\Trading bot\\.venv\\Scripts\\python.exe -m src.stage0.live --source binance-spot --symbol BTCUSDT --allow-binance-network --check",
+        "exit_code": 0,
+        "timed_out": false,
+        "stdout_file": "binance_spot.rest_check.stdout.json",
+        "stderr_file": "binance_spot.rest_check.stderr.log"
+      },
+      "collection_run": {
+        "command": "C:\\vscode\\Trading bot\\.venv\\Scripts\\python.exe -m src.stage0.live --source binance-spot --symbol BTCUSDT --allow-binance-network --seconds 30 --out stage0-binance-local\\binance_spot.events.jsonl",
+        "exit_code": 0,
+        "timed_out": false,
+        "stdout_file": "binance_spot.websocket_collect.stdout.json",
+        "stderr_file": "binance_spot.websocket_collect.stderr.log"
+      },
+      "collection_summary": {
+        "exit_code": 0,
+        "error": null,
+        "unhealthy_reasons": [],
+        "envelopes": 13115,
+        "rejected": 0,
+        "issues": {},
+        "reconnects": 0,
+        "resyncs": 0,
+        "rest_retries": 0,
+        "ws_events_by_type": {
+          "ORDERBOOK_DELTA": 295,
+          "BOOK_TICKER": 10275,
+          "TRADE": 2544
+        },
+        "rest_events_by_type": {},
+        "rejected_by_error": {},
+        "end_of_collection": {
+          "at": "2026-11-19T20:45:53.291062+00:00",
+          "core_types": [
+            "TRADE",
+            "BOOK_TICKER"
+          ],
+          "readiness": "READY",
+          "per_type": {
+            "BOOK_TICKER": "OK",
+            "ORDERBOOK_DELTA": "OK",
+            "TRADE": "OK"
+          }
+        },
+        "rest_failures": [],
+        "max_gap_s": 0.7
+      },
+      "events_file": {
+        "file_present": true,
+        "lines": 13115,
+        "invalid_lines": 0,
+        "types": {
+          "BOOK_TICKER": 10275,
+          "ORDERBOOK_DELTA": 295,
+          "ORDERBOOK_SNAPSHOT": 1,
+          "TRADE": 2544
+        },
+        "sha256": "5778a9a7470113d141afeb30351fe4486787815ba42d3ff205b03121f4a88c98"
+      },
+      "required_ws_types": [
+        "TRADE",
+        "BOOK_TICKER",
+        "ORDERBOOK_DELTA"
+      ],
+      "notes": "PASS proves public REST+WS data in THIS runner only; it is not trading readiness."
+    },
+    {
+      "source": "binance-futures",
+      "symbol": "BTCUSDT",
+      "environment_blocked": false,
+      "blocked_reason": null,
+      "status": "PASS",
+      "stages": {
+        "rest": {
+          "status": "PASS",
+          "reason": "all endpoints PASS",
+          "endpoints": [
+            {
+              "endpoint": "/fapi/v1/time",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": [
+                "serverTime"
+              ],
+              "extra_keys": [],
+              "missing_keys": [],
+              "clock_offset_ms": -119,
+              "reason": "serverTime present and plausible"
+            },
+            {
+              "endpoint": "/fapi/v1/ticker/price",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": [
+                "price",
+                "symbol",
+                "time"
+              ],
+              "extra_keys": [
+                "time"
+              ],
+              "missing_keys": [],
+              "parsed_events": 1,
+              "structure": "PASS",
+              "reason": "structure matches parser; values not independently verified"
+            },
+            {
+              "endpoint": "/fapi/v1/depth",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": [
+                "E",
+                "T",
+                "asks",
+                "bids",
+                "lastUpdateId"
+              ],
+              "extra_keys": [
+                "E",
+                "T"
+              ],
+              "missing_keys": [],
+              "parsed_events": 1,
+              "structure": "PASS",
+              "reason": "structure matches parser; values not independently verified"
+            },
+            {
+              "endpoint": "/fapi/v1/openInterest",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": [
+                "openInterest",
+                "symbol",
+                "time"
+              ],
+              "extra_keys": [],
+              "missing_keys": [],
+              "parsed_events": 1,
+              "structure": "PASS",
+              "reason": "structure matches parser; values not independently verified"
+            },
+            {
+              "endpoint": "/fapi/v1/fundingRate",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": "array[1]",
+              "extra_keys": [
+                "markPrice",
+                "rateType"
+              ],
+              "missing_keys": [],
+              "parsed_events": 1,
+              "structure": "PASS",
+              "reason": "structure matches parser; values not independently verified"
+            },
+            {
+              "endpoint": "/futures/data/globalLongShortAccountRatio",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": "array[1]",
+              "extra_keys": [],
+              "missing_keys": [],
+              "parsed_events": 1,
+              "structure": "PASS",
+              "reason": "structure matches parser; values not independently verified"
+            }
+          ]
+        },
+        "ws_received": {
+          "status": "PASS",
+          "reason": "all required types received over WebSocket",
+          "counts": {
+            "BOOK_TICKER": 52523,
+            "TRADE": 1499,
+            "ORDERBOOK_DELTA": 290,
+            "MARK_PRICE": 30,
+            "INDEX_PRICE": 30,
+            "FUNDING_RATE": 30
+          }
+        },
+        "ws_parsed": {
+          "status": "PASS",
+          "reason": "54406 parsed, 0 rejected"
+        },
+        "ws_fresh": {
+          "status": "PASS",
+          "reason": "largest gap between messages 0.9s (limit 20.0s)"
+        },
+        "gate_ready": {
+          "status": "PASS",
+          "reason": "core types ['TRADE', 'BOOK_TICKER', 'MARK_PRICE'] READY at end of data",
+          "per_type": {
+            "BOOK_TICKER": "OK",
+            "FUNDING_RATE": "OK",
+            "INDEX_PRICE": "OK",
+            "LONG_SHORT_RATIO": "OK",
+            "MARK_PRICE": "OK",
+            "OPEN_INTEREST": "OK",
+            "ORDERBOOK_DELTA": "OK",
+            "TRADE": "OK"
+          }
+        }
+      },
+      "rest_check_run": {
+        "command": "C:\\vscode\\Trading bot\\.venv\\Scripts\\python.exe -m src.stage0.live --source binance-futures --symbol BTCUSDT --allow-binance-network --check",
+        "exit_code": 0,
+        "timed_out": false,
+        "stdout_file": "binance_futures.rest_check.stdout.json",
+        "stderr_file": "binance_futures.rest_check.stderr.log"
+      },
+      "collection_run": {
+        "command": "C:\\vscode\\Trading bot\\.venv\\Scripts\\python.exe -m src.stage0.live --source binance-futures --symbol BTCUSDT --allow-binance-network --seconds 30 --out stage0-binance-local\\binance_futures.events.jsonl",
+        "exit_code": 0,
+        "timed_out": false,
+        "stdout_file": "binance_futures.websocket_collect.stdout.json",
+        "stderr_file": "binance_futures.websocket_collect.stderr.log"
+      },
+      "collection_summary": {
+        "exit_code": 0,
+        "error": null,
+        "unhealthy_reasons": [],
+        "envelopes": 54406,
+        "rejected": 0,
+        "issues": {},
+        "reconnects": 0,
+        "resyncs": 0,
+        "rest_retries": 0,
+        "ws_events_by_type": {
+          "BOOK_TICKER": 52523,
+          "TRADE": 1499,
+          "ORDERBOOK_DELTA": 290,
+          "MARK_PRICE": 30,
+          "INDEX_PRICE": 30,
+          "FUNDING_RATE": 30
+        },
+        "rest_events_by_type": {
+          "OPEN_INTEREST": 1,
+          "FUNDING_RATE": 1,
+          "LONG_SHORT_RATIO": 1
+        },
+        "rejected_by_error": {},
+        "end_of_collection": {
+          "at": "2026-11-19T20:46:27.661425+00:00",
+          "core_types": [
+            "TRADE",
+            "BOOK_TICKER",
+            "MARK_PRICE"
+          ],
+          "readiness": "READY",
+          "per_type": {
+            "BOOK_TICKER": "OK",
+            "FUNDING_RATE": "OK",
+            "INDEX_PRICE": "OK",
+            "LONG_SHORT_RATIO": "OK",
+            "MARK_PRICE": "OK",
+            "OPEN_INTEREST": "OK",
+            "ORDERBOOK_DELTA": "OK",
+            "TRADE": "OK"
+          }
+        },
+        "rest_failures": [],
+        "max_gap_s": 0.9
+      },
+      "events_file": {
+        "file_present": true,
+        "lines": 54406,
+        "invalid_lines": 0,
+        "types": {
+          "BOOK_TICKER": 52523,
+          "FUNDING_RATE": 31,
+          "INDEX_PRICE": 30,
+          "LONG_SHORT_RATIO": 1,
+          "MARK_PRICE": 30,
+          "OPEN_INTEREST": 1,
+          "ORDERBOOK_DELTA": 290,
+          "ORDERBOOK_SNAPSHOT": 1,
+          "TRADE": 1499
+        },
+        "sha256": "ffd12c0c082be7e6da6d9e5fada737f6dcecf2b23b1f48da23517d0c41336831"
+      },
+      "required_ws_types": [
+        "TRADE",
+        "BOOK_TICKER",
+        "ORDERBOOK_DELTA",
+        "MARK_PRICE"
+      ],
+      "notes": "PASS proves public REST+WS data in THIS runner only; it is not trading readiness."
+    }
+  ]
+}

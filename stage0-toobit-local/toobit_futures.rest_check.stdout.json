@@ -1,0 +1,162 @@
+{
+  "summary": {
+    "PASS": 8,
+    "INCONCLUSIVE": 2
+  },
+  "endpoints": [
+    {
+      "endpoint": "/api/v1/time",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": [
+        "serverTime"
+      ],
+      "extra_keys": [],
+      "missing_keys": [],
+      "clock_offset_ms": -119,
+      "reason": "serverTime present and plausible"
+    },
+    {
+      "endpoint": "/quote/v1/contract/ticker/price",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": "array[1]",
+      "extra_keys": [],
+      "missing_keys": [],
+      "parsed_events": 1,
+      "structure": "PASS",
+      "reason": "structure matches parser; semantics are DOC-level only (not independently verified)"
+    },
+    {
+      "endpoint": "/quote/v1/trades",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": "array[5]",
+      "extra_keys": [],
+      "missing_keys": [],
+      "parsed_events": 5,
+      "structure": "PASS",
+      "reason": "structure matches parser; semantics are DOC-level only (not independently verified)"
+    },
+    {
+      "endpoint": "/quote/v1/depth",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": [
+        "a",
+        "b",
+        "t"
+      ],
+      "extra_keys": [],
+      "missing_keys": [],
+      "parsed_events": 1,
+      "structure": "PASS",
+      "reason": "structure matches parser; semantics are DOC-level only (not independently verified)"
+    },
+    {
+      "endpoint": "/quote/v1/contract/ticker/bookTicker",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": "array[1]",
+      "extra_keys": [
+        "E"
+      ],
+      "missing_keys": [],
+      "parsed_events": 1,
+      "structure": "PASS",
+      "reason": "structure matches parser; semantics are DOC-level only (not independently verified)"
+    },
+    {
+      "endpoint": "/quote/v1/markPrice",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": [
+        "exchangeId",
+        "price",
+        "symbolId",
+        "time"
+      ],
+      "extra_keys": [],
+      "missing_keys": [],
+      "parsed_events": 1,
+      "structure": "PASS",
+      "reason": "structure matches parser; semantics are DOC-level only (not independently verified)"
+    },
+    {
+      "endpoint": "/quote/v1/index",
+      "verdict": "INCONCLUSIVE",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": [
+        "edp",
+        "index"
+      ],
+      "extra_keys": [],
+      "missing_keys": [],
+      "parsed_events": 1,
+      "structure": "PASS",
+      "reason": "structure matches the parser, but docs leave unit/symbol meaning open (stays UNVERIFIED)"
+    },
+    {
+      "endpoint": "/api/v1/futures/fundingRate",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": "array[1]",
+      "extra_keys": [],
+      "missing_keys": [],
+      "parsed_events": 1,
+      "structure": "PASS",
+      "reason": "structure matches parser; semantics are DOC-level only (not independently verified)"
+    },
+    {
+      "endpoint": "/quote/v1/openInterest",
+      "verdict": "INCONCLUSIVE",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": [
+        "openInterestList"
+      ],
+      "extra_keys": [],
+      "missing_keys": [],
+      "parsed_events": 1,
+      "structure": "PASS",
+      "reason": "structure matches the parser, but docs leave unit/symbol meaning open (stays UNVERIFIED)"
+    },
+    {
+      "endpoint": "/api/v1/exchangeInfo",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": [
+        "brokerFilters",
+        "coins",
+        "contracts",
+        "options",
+        "rateLimits",
+        "serverTime",
+        "symbols",
+        "timezone"
+      ],
+      "extra_keys": [
+        "brokerFilters",
+        "coins",
+        "options",
+        "rateLimits",
+        "serverTime",
+        "symbols",
+        "timezone"
+      ],
+      "missing_keys": [],
+      "parsed_events": 1,
+      "structure": "PASS",
+      "reason": "structure matches parser; semantics are DOC-level only (not independently verified)"
+    }
+  ]
+}

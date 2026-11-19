@@ -1,0 +1,102 @@
+{
+  "summary": {
+    "PASS": 6
+  },
+  "endpoints": [
+    {
+      "endpoint": "/fapi/v1/time",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": [
+        "serverTime"
+      ],
+      "extra_keys": [],
+      "missing_keys": [],
+      "clock_offset_ms": -119,
+      "reason": "serverTime present and plausible"
+    },
+    {
+      "endpoint": "/fapi/v1/ticker/price",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": [
+        "price",
+        "symbol",
+        "time"
+      ],
+      "extra_keys": [
+        "time"
+      ],
+      "missing_keys": [],
+      "parsed_events": 1,
+      "structure": "PASS",
+      "reason": "structure matches parser; values not independently verified"
+    },
+    {
+      "endpoint": "/fapi/v1/depth",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": [
+        "E",
+        "T",
+        "asks",
+        "bids",
+        "lastUpdateId"
+      ],
+      "extra_keys": [
+        "E",
+        "T"
+      ],
+      "missing_keys": [],
+      "parsed_events": 1,
+      "structure": "PASS",
+      "reason": "structure matches parser; values not independently verified"
+    },
+    {
+      "endpoint": "/fapi/v1/openInterest",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": [
+        "openInterest",
+        "symbol",
+        "time"
+      ],
+      "extra_keys": [],
+      "missing_keys": [],
+      "parsed_events": 1,
+      "structure": "PASS",
+      "reason": "structure matches parser; values not independently verified"
+    },
+    {
+      "endpoint": "/fapi/v1/fundingRate",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": "array[1]",
+      "extra_keys": [
+        "markPrice",
+        "rateType"
+      ],
+      "missing_keys": [],
+      "parsed_events": 1,
+      "structure": "PASS",
+      "reason": "structure matches parser; values not independently verified"
+    },
+    {
+      "endpoint": "/futures/data/globalLongShortAccountRatio",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": "array[1]",
+      "extra_keys": [],
+      "missing_keys": [],
+      "parsed_events": 1,
+      "structure": "PASS",
+      "reason": "structure matches parser; values not independently verified"
+    }
+  ]
+}

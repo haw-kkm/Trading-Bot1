@@ -1,0 +1,48 @@
+{
+  "exit_code": 0,
+  "error": null,
+  "unhealthy_reasons": [],
+  "envelopes": 477,
+  "rejected": 0,
+  "issues": {
+    "DUPLICATE_EVENT": 1
+  },
+  "reconnects": 0,
+  "resyncs": 0,
+  "rest_retries": 0,
+  "ws_events_by_type": {
+    "TRADE": 176,
+    "ORDERBOOK_SNAPSHOT": 99,
+    "BOOK_TICKER": 167,
+    "MARK_PRICE": 30
+  },
+  "rest_events_by_type": {
+    "FUNDING_RATE": 1,
+    "OPEN_INTEREST": 1,
+    "MARK_PRICE": 1,
+    "INDEX_PRICE": 1,
+    "CONTRACT_SPEC": 1
+  },
+  "rejected_by_error": {},
+  "end_of_collection": {
+    "at": "2026-11-19T20:47:40.408232+00:00",
+    "core_types": [
+      "TRADE",
+      "BOOK_TICKER",
+      "MARK_PRICE"
+    ],
+    "readiness": "READY",
+    "per_type": {
+      "BOOK_TICKER": "OK",
+      "CONTRACT_SPEC": "OK",
+      "FUNDING_RATE": "OK",
+      "INDEX_PRICE": "UNVERIFIED",
+      "MARK_PRICE": "OK",
+      "OPEN_INTEREST": "UNVERIFIED",
+      "ORDERBOOK_SNAPSHOT": "OK",
+      "TRADE": "OK"
+    }
+  },
+  "rest_failures": [],
+  "max_gap_s": 1.3
+}

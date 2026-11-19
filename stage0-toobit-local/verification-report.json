@@ -1,0 +1,298 @@
+{
+  "created_at_utc": "2026-11-19T20:47:42.636160+00:00",
+  "python": "3.14.5",
+  "verification_seconds": 30,
+  "trading_or_account_requests": false,
+  "tested_sources": [
+    "toobit-futures"
+  ],
+  "overall": "INCONCLUSIVE",
+  "results": [
+    {
+      "source": "toobit-futures",
+      "symbol": "BTC-SWAP-USDT",
+      "environment_blocked": false,
+      "blocked_reason": null,
+      "status": "INCONCLUSIVE",
+      "stages": {
+        "rest": {
+          "status": "INCONCLUSIVE",
+          "reason": "2 endpoint(s) INCONCLUSIVE (empty / meaning unverified)",
+          "endpoints": [
+            {
+              "endpoint": "/api/v1/time",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": [
+                "serverTime"
+              ],
+              "extra_keys": [],
+              "missing_keys": [],
+              "clock_offset_ms": -119,
+              "reason": "serverTime present and plausible"
+            },
+            {
+              "endpoint": "/quote/v1/contract/ticker/price",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": "array[1]",
+              "extra_keys": [],
+              "missing_keys": [],
+              "parsed_events": 1,
+              "structure": "PASS",
+              "reason": "structure matches parser; semantics are DOC-level only (not independently verified)"
+            },
+            {
+              "endpoint": "/quote/v1/trades",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": "array[5]",
+              "extra_keys": [],
+              "missing_keys": [],
+              "parsed_events": 5,
+              "structure": "PASS",
+              "reason": "structure matches parser; semantics are DOC-level only (not independently verified)"
+            },
+            {
+              "endpoint": "/quote/v1/depth",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": [
+                "a",
+                "b",
+                "t"
+              ],
+              "extra_keys": [],
+              "missing_keys": [],
+              "parsed_events": 1,
+              "structure": "PASS",
+              "reason": "structure matches parser; semantics are DOC-level only (not independently verified)"
+            },
+            {
+              "endpoint": "/quote/v1/contract/ticker/bookTicker",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": "array[1]",
+              "extra_keys": [
+                "E"
+              ],
+              "missing_keys": [],
+              "parsed_events": 1,
+              "structure": "PASS",
+              "reason": "structure matches parser; semantics are DOC-level only (not independently verified)"
+            },
+            {
+              "endpoint": "/quote/v1/markPrice",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": [
+                "exchangeId",
+                "price",
+                "symbolId",
+                "time"
+              ],
+              "extra_keys": [],
+              "missing_keys": [],
+              "parsed_events": 1,
+              "structure": "PASS",
+              "reason": "structure matches parser; semantics are DOC-level only (not independently verified)"
+            },
+            {
+              "endpoint": "/quote/v1/index",
+              "verdict": "INCONCLUSIVE",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": [
+                "edp",
+                "index"
+              ],
+              "extra_keys": [],
+              "missing_keys": [],
+              "parsed_events": 1,
+              "structure": "PASS",
+              "reason": "structure matches the parser, but docs leave unit/symbol meaning open (stays UNVERIFIED)"
+            },
+            {
+              "endpoint": "/api/v1/futures/fundingRate",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": "array[1]",
+              "extra_keys": [],
+              "missing_keys": [],
+              "parsed_events": 1,
+              "structure": "PASS",
+              "reason": "structure matches parser; semantics are DOC-level only (not independently verified)"
+            },
+            {
+              "endpoint": "/quote/v1/openInterest",
+              "verdict": "INCONCLUSIVE",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": [
+                "openInterestList"
+              ],
+              "extra_keys": [],
+              "missing_keys": [],
+              "parsed_events": 1,
+              "structure": "PASS",
+              "reason": "structure matches the parser, but docs leave unit/symbol meaning open (stays UNVERIFIED)"
+            },
+            {
+              "endpoint": "/api/v1/exchangeInfo",
+              "verdict": "PASS",
+              "request_ok": true,
+              "http_status": 200,
+              "top_level": [
+                "brokerFilters",
+                "coins",
+                "contracts",
+                "options",
+                "rateLimits",
+                "serverTime",
+                "symbols",
+                "timezone"
+              ],
+              "extra_keys": [
+                "brokerFilters",
+                "coins",
+                "options",
+                "rateLimits",
+                "serverTime",
+                "symbols",
+                "timezone"
+              ],
+              "missing_keys": [],
+              "parsed_events": 1,
+              "structure": "PASS",
+              "reason": "structure matches parser; semantics are DOC-level only (not independently verified)"
+            }
+          ]
+        },
+        "ws_received": {
+          "status": "PASS",
+          "reason": "all required types received over WebSocket",
+          "counts": {
+            "TRADE": 176,
+            "ORDERBOOK_SNAPSHOT": 99,
+            "BOOK_TICKER": 167,
+            "MARK_PRICE": 30
+          }
+        },
+        "ws_parsed": {
+          "status": "PASS",
+          "reason": "477 parsed, 0 rejected"
+        },
+        "ws_fresh": {
+          "status": "PASS",
+          "reason": "largest gap between messages 1.3s (limit 20.0s)"
+        },
+        "gate_ready": {
+          "status": "PASS",
+          "reason": "core types ['TRADE', 'BOOK_TICKER', 'MARK_PRICE'] READY at end of data",
+          "per_type": {
+            "BOOK_TICKER": "OK",
+            "CONTRACT_SPEC": "OK",
+            "FUNDING_RATE": "OK",
+            "INDEX_PRICE": "UNVERIFIED",
+            "MARK_PRICE": "OK",
+            "OPEN_INTEREST": "UNVERIFIED",
+            "ORDERBOOK_SNAPSHOT": "OK",
+            "TRADE": "OK"
+          }
+        }
+      },
+      "rest_check_run": {
+        "command": "C:\\vscode\\Trading bot\\.venv\\Scripts\\python.exe -m src.stage0.live --source toobit-futures --symbol BTC-SWAP-USDT --allow-toobit-network --i-approve-toobit-public-readonly --check",
+        "exit_code": 0,
+        "timed_out": false,
+        "stdout_file": "toobit_futures.rest_check.stdout.json",
+        "stderr_file": "toobit_futures.rest_check.stderr.log"
+      },
+      "collection_run": {
+        "command": "C:\\vscode\\Trading bot\\.venv\\Scripts\\python.exe -m src.stage0.live --source toobit-futures --symbol BTC-SWAP-USDT --allow-toobit-network --i-approve-toobit-public-readonly --seconds 30 --out stage0-toobit-local\\toobit_futures.events.jsonl",
+        "exit_code": 0,
+        "timed_out": false,
+        "stdout_file": "toobit_futures.websocket_collect.stdout.json",
+        "stderr_file": "toobit_futures.websocket_collect.stderr.log"
+      },
+      "collection_summary": {
+        "exit_code": 0,
+        "error": null,
+        "unhealthy_reasons": [],
+        "envelopes": 477,
+        "rejected": 0,
+        "issues": {
+          "DUPLICATE_EVENT": 1
+        },
+        "reconnects": 0,
+        "resyncs": 0,
+        "rest_retries": 0,
+        "ws_events_by_type": {
+          "TRADE": 176,
+          "ORDERBOOK_SNAPSHOT": 99,
+          "BOOK_TICKER": 167,
+          "MARK_PRICE": 30
+        },
+        "rest_events_by_type": {
+          "FUNDING_RATE": 1,
+          "OPEN_INTEREST": 1,
+          "MARK_PRICE": 1,
+          "INDEX_PRICE": 1,
+          "CONTRACT_SPEC": 1
+        },
+        "rejected_by_error": {},
+        "end_of_collection": {
+          "at": "2026-11-19T20:47:40.408232+00:00",
+          "core_types": [
+            "TRADE",
+            "BOOK_TICKER",
+            "MARK_PRICE"
+          ],
+          "readiness": "READY",
+          "per_type": {
+            "BOOK_TICKER": "OK",
+            "CONTRACT_SPEC": "OK",
+            "FUNDING_RATE": "OK",
+            "INDEX_PRICE": "UNVERIFIED",
+            "MARK_PRICE": "OK",
+            "OPEN_INTEREST": "UNVERIFIED",
+            "ORDERBOOK_SNAPSHOT": "OK",
+            "TRADE": "OK"
+          }
+        },
+        "rest_failures": [],
+        "max_gap_s": 1.3
+      },
+      "events_file": {
+        "file_present": true,
+        "lines": 477,
+        "invalid_lines": 0,
+        "types": {
+          "BOOK_TICKER": 167,
+          "CONTRACT_SPEC": 1,
+          "FUNDING_RATE": 1,
+          "INDEX_PRICE": 1,
+          "MARK_PRICE": 31,
+          "OPEN_INTEREST": 1,
+          "ORDERBOOK_SNAPSHOT": 99,
+          "TRADE": 176
+        },
+        "sha256": "cd2728db020cfdda6eca70566394445979e63ead43c1be085c608e98765691cc"
+      },
+      "required_ws_types": [
+        "TRADE",
+        "BOOK_TICKER",
+        "ORDERBOOK_SNAPSHOT",
+        "MARK_PRICE"
+      ],
+      "notes": "PASS proves public REST+WS data in THIS runner only; it is not trading readiness."
+    }
+  ]
+}

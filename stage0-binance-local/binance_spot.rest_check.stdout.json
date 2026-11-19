@@ -1,0 +1,51 @@
+{
+  "summary": {
+    "PASS": 3
+  },
+  "endpoints": [
+    {
+      "endpoint": "/api/v3/time",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": [
+        "serverTime"
+      ],
+      "extra_keys": [],
+      "missing_keys": [],
+      "clock_offset_ms": -133,
+      "reason": "serverTime present and plausible"
+    },
+    {
+      "endpoint": "/api/v3/ticker/price",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": [
+        "price",
+        "symbol"
+      ],
+      "extra_keys": [],
+      "missing_keys": [],
+      "parsed_events": 1,
+      "structure": "PASS",
+      "reason": "structure matches parser; values not independently verified"
+    },
+    {
+      "endpoint": "/api/v3/depth",
+      "verdict": "PASS",
+      "request_ok": true,
+      "http_status": 200,
+      "top_level": [
+        "asks",
+        "bids",
+        "lastUpdateId"
+      ],
+      "extra_keys": [],
+      "missing_keys": [],
+      "parsed_events": 1,
+      "structure": "PASS",
+      "reason": "structure matches parser; values not independently verified"
+    }
+  ]
+}
