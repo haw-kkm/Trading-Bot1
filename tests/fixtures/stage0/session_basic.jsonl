@@ -13,4 +13,5 @@
 {"t":"2026-03-31T12:00:01.200Z","source":"binance-futures","kind":"ws","msg":{"e":"forceOrder","E":1774958401100,"o":{"s":"BTCUSDT","S":"SELL","o":"LIMIT","f":"IOC","q":"0.5","p":"49900","ap":"49905","X":"FILLED","l":"0.5","z":"0.5","T":1774958401099}}}
 {"t":"2026-03-31T12:00:01.300Z","source":"toobit-futures","kind":"ticker","msg":[{"s":"BTC-SWAP-USDT","p":"50003.0"}]}
 {"t":"2026-03-31T12:00:01.400Z","source":"toobit-futures","kind":"trades","symbol":"BTC-SWAP-USDT","msg":[{"t":1774958401300,"p":"50003.5","q":"3","ibm":true}]}
+{"t":"2026-03-31T12:00:01.450Z","source":"toobit-futures","kind":"open_interest","msg":{"openInterestList":[{"size":"1000","symbol":"BTC-SWAP-USDT"}]}}
 {"t":"2026-03-31T12:00:01.500Z","source":"binance-spot","kind":"ws","msg":{"e":"bogus"}}

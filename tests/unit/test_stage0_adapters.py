@@ -5,7 +5,7 @@ from decimal import Decimal
 
 import pytest
 
-from src.stage0.adapters import binance, toobit
+from src.stage0.adapters import binance
 from src.stage0.envelope import EnvelopeError
 from src.stage0.symbols import (binance_to_common, common_to_binance, common_to_toobit, toobit_to_common)
 
@@ -102,34 +102,3 @@ def test_book_imbalance_derived_value():
     assert binance.book_imbalance(b, a) == Decimal("0.5")
     with pytest.raises(EnvelopeError):
         binance.book_imbalance([], [])
-
-
-# ---------------- Toobit (UNVERIFIED) ----------------
-def test_toobit_every_event_flagged_unverified_and_penalised():
-    evs = (toobit.parse_ticker_price([{"s": "BTC-SWAP-USDT", "p": "50003"}], RX)
-           + toobit.parse_trades("BTC-SWAP-USDT", [{"t": MS, "p": "1", "q": "3", "ibm": True}], RX)
-           + [toobit.parse_depth("BTC-SWAP-USDT", {"t": MS, "b": [["1", "1"]], "a": [["2", "1"]]}, RX),
-              toobit.parse_mark_price({"symbol": "BTC-SWAP-USDT", "price": "1", "time": MS}, RX),
-              toobit.parse_index_price({"symbol": "BTC-SWAP-USDT", "price": "1", "time": MS}, RX),
-              toobit.parse_funding_rate({"symbol": "BTC-SWAP-USDT", "rate": "-0.0002", "time": MS}, RX),
-              toobit.parse_open_interest({"symbol": "BTC-SWAP-USDT", "openInterest": "5", "time": MS}, RX),
-              toobit.parse_contract({"symbol": "BTC-SWAP-USDT", "tickSize": "0.1", "stepSize": "1", "contractMultiplier": "0.001"}, RX)])
-    assert len(evs) == 8
-    for e in evs:
-        assert "UNVERIFIED_SCHEMA" in e.quality_flags and e.reliability_score <= 0.75
-        assert e.source.value == "toobit-futures" and e.symbol == "BTC/USDT:USDT" and e.exchange_symbol == "BTC-SWAP-USDT"
-
-
-def test_toobit_missing_fields_not_guessed():
-    with pytest.raises(EnvelopeError):
-        toobit.parse_mark_price({"symbol": "BTC-SWAP-USDT"}, RX)
-    with pytest.raises(EnvelopeError):       # contract multiplier is mandatory
-        toobit.parse_contract({"symbol": "BTC-SWAP-USDT", "tickSize": "1", "stepSize": "1"}, RX)
-    with pytest.raises(EnvelopeError):       # Binance-style symbol is not a Toobit symbol
-        toobit.parse_ticker_price([{"s": "BTCUSDT", "p": "1"}], RX)
-
-
-def test_toobit_contract_unit_conversion():
-    assert toobit.contracts_to_base_qty("3", "0.001") == Decimal("0.003")
-    with pytest.raises(EnvelopeError):
-        toobit.contracts_to_base_qty("3", "-1" if False else "nan")

@@ -78,6 +78,13 @@ class DataQualityGate:
         for s in symbols:
             self._syncing.add((source.value, s))
 
+    def on_clock_offset(self, source: Source, offset_ms: int, max_ms: int = 1000):
+        """Local-vs-exchange clock offset (from /time). Large skew makes lag/future checks unreliable."""
+        self.clock_offsets = getattr(self, "clock_offsets", {})
+        self.clock_offsets[source.value] = offset_ms
+        if abs(offset_ms) > max_ms:
+            self._issue("CLOCK_SKEW", source, "", f"{offset_ms} ms")
+
     def mark_synced(self, source: Source, symbol: str):
         self._syncing.discard((source.value, symbol))
         self._invalid.pop((source.value, symbol), None)
@@ -104,7 +111,7 @@ class DataQualityGate:
         found: List[str] = []
         src, sym = env.source.value, env.symbol
         if "UNVERIFIED_SCHEMA" in env.quality_flags:
-            self._unverified.add(src)
+            self._unverified.add((src, sym, env.event_type.value))
         key = (src, sym, env.event_type.value)
 
         def flag(kind, detail=""):
@@ -115,7 +122,7 @@ class DataQualityGate:
             flag("FUTURE_EVENT_TIME", str(env.event_time))
         if env.event_time and env.received_at - env.event_time > self.max_receive_lag:
             flag("RECEIVE_LAG", str(env.received_at - env.event_time))
-        if env.sequence_id is not None:
+        if env.sequence_id is not None and env.event_type != EventType.ORDERBOOK_SNAPSHOT:
             seen = self._seen_seq.setdefault(key, set())
             if env.sequence_id in seen:
                 flag("DUPLICATE_EVENT", env.sequence_id)
@@ -153,9 +160,13 @@ class DataQualityGate:
         return found
 
     # ---- status ----------------------------------------------------------------------------
-    def status(self, source: Source, symbol: str, now: datetime) -> Readiness:
+    def status(self, source: Source, symbol: str, now: datetime, types=None) -> Readiness:
+        """`types`: event types the consumer relies on (EventType values / enums). None = every type
+        seen for this symbol. Any of them carrying UNVERIFIED_SCHEMA => UNVERIFIED (never READY)."""
         src = source.value
-        if src in self._unverified:
+        wanted = None if types is None else {getattr(t, "value", t) for t in types}
+        if any(u[0] == src and u[1] == symbol and (wanted is None or u[2] in wanted)
+               for u in self._unverified):
             return Readiness.UNVERIFIED
         if self._conn.get(src) is not True:
             return Readiness.DISCONNECTED
@@ -168,9 +179,9 @@ class DataQualityGate:
             return Readiness.STALE
         return Readiness.READY
 
-    def usable(self, source: Source, symbol: str, now: datetime) -> bool:
+    def usable(self, source: Source, symbol: str, now: datetime, types=None) -> bool:
         """The ONLY question downstream may ask. False unless READY."""
-        return self.status(source, symbol, now) == Readiness.READY
+        return self.status(source, symbol, now, types) == Readiness.READY
 
     # ---- cross-exchange divergence ---------------------------------------------------------
     def divergence(self, a: Source, b: Source, symbol: str, kind: str, now: datetime,

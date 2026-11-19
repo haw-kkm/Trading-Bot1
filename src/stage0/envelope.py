@@ -79,7 +79,7 @@ _SPEC = {
     EventType.SERVER_TIME: ((), (), (), ()),
 }
 _OPTIONAL_DEC = ("index_price", "mark_price", "next_funding_time_ms", "contract_size", "tick_size",
-                 "step_size", "imbalance", "last_price", "quote_volume", "server_time_ms")
+                 "step_size", "edp_10m_avg", "imbalance", "last_price", "quote_volume", "server_time_ms")
 _BOOK_TYPES = (EventType.ORDERBOOK_SNAPSHOT, EventType.ORDERBOOK_DELTA)
 
 

@@ -159,7 +159,7 @@ def test_toobit_is_unverified_never_ready():
     g = DataQualityGate()
     g.on_connect(Source.TOOBIT_FUTURES)
     from src.stage0.adapters import toobit
-    g.observe(toobit.parse_ticker_price([{"s": "BTC-SWAP-USDT", "p": "1"}], T0)[0])
+    g.observe(toobit.parse_open_interest({"openInterestList": [{"size": "5", "symbol": "BTC-SWAP-USDT"}]}, T0)[0])
     assert g.status(Source.TOOBIT_FUTURES, "BTC/USDT:USDT", T0) == Readiness.UNVERIFIED
     assert not g.usable(Source.TOOBIT_FUTURES, "BTC/USDT:USDT", T0)
 
