@@ -60,13 +60,21 @@ PUBLIC_PATHS = {
                             "/quote/v1/markPrice", "/quote/v1/index", "/api/v1/futures/fundingRate",
                             "/quote/v1/openInterest", "/quote/v1/klines"},
 }
-# Toobit REST host is NOT stated on the docs pages read; https://api.toobit.com comes from ccxt's
-# toobit definition (secondary source) -> confirm with the --check run.
+# Toobit REST host: "The base endpoint is: https://api.toobit.com"
+# (https://api-docs.toobit.com/api/basic-information.html, read 2026-11-20). Live reachability: unverified.
 HOSTS = {Source.BINANCE_SPOT: "https://api.binance.com", Source.BINANCE_FUTURES: "https://fapi.binance.com",
          Source.TOOBIT_FUTURES: "https://api.toobit.com"}
+# Binance USDS-M futures moved to routed paths (legacy /stream and /ws were announced for removal on
+# 2026-04-23): /public = bookTicker + depth, /market = aggTrade, markPrice, kline, forceOrder.
+# Source: https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/Important-WebSocket-Change-Notice
+BINANCE_FUTURES_WS = {"public": "wss://fstream.binance.com/public/stream",
+                      "market": "wss://fstream.binance.com/market/stream"}
 WS_URLS = {Source.BINANCE_SPOT: "wss://stream.binance.com:9443/stream",
-           Source.BINANCE_FUTURES: "wss://fstream.binance.com/stream",
+           Source.BINANCE_FUTURES: BINANCE_FUTURES_WS["public"],
            Source.TOOBIT_FUTURES: "wss://stream.toobit.com/quote/ws/v1"}
+WS_ALLOWED = {Source.BINANCE_SPOT: (WS_URLS[Source.BINANCE_SPOT],),
+              Source.BINANCE_FUTURES: tuple(BINANCE_FUTURES_WS.values()),
+              Source.TOOBIT_FUTURES: (WS_URLS[Source.TOOBIT_FUTURES],)}
 _FORBIDDEN_PARAMS = {"signature", "apikey", "api_key", "timestamp_sig", "recvwindow"}
 
 
@@ -87,12 +95,50 @@ class PublicRestClient:
         return transport(url, params)
 
 
+class HttpError(Exception):
+    """HTTP status != 2xx. Carries status and LOWER-CASED response headers only (never the body)."""
+
+    def __init__(self, status: int, headers: Optional[Dict[str, str]] = None):
+        super().__init__(f"HTTP {status}")
+        self.status, self.headers = status, {k.lower(): v for k, v in (headers or {}).items()}
+
+
+class TransportError(Exception):
+    """No HTTP response: timeout / connection failure. kind in {"timeout", "connection"}."""
+
+    def __init__(self, kind: str):
+        super().__init__(kind)
+        self.kind = kind
+
+
+class ResponseFormatError(Exception):
+    """2xx but not valid JSON (permanent for this request)."""
+
+
 def _urllib_get(url: str, params: Dict):            # pragma: no cover - never reached in tests
+    """Plain unauthenticated GET. No API-key header, no signature, whatever the environment holds."""
+    import socket
+    import urllib.error
     import urllib.parse
     import urllib.request
     q = urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url + ("?" + q if q else ""), timeout=10) as r:   # noqa: S310
-        return json.loads(r.read().decode())
+    req = urllib.request.Request(url + ("?" + q if q else ""), method="GET",
+                                 headers={"User-Agent": "stage0-public-readonly", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:   # noqa: S310
+            body = r.read().decode()
+    except urllib.error.HTTPError as e:
+        raise HttpError(e.code, dict(e.headers or {}))
+    except (socket.timeout, TimeoutError):
+        raise TransportError("timeout")
+    except urllib.error.URLError as e:
+        raise TransportError("timeout" if isinstance(e.reason, (socket.timeout, TimeoutError)) else "connection")
+    except OSError:
+        raise TransportError("connection")
+    try:
+        return json.loads(body)
+    except ValueError:
+        raise ResponseFormatError("invalid JSON body")
 
 
 @dataclass

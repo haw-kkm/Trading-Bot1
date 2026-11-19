@@ -1,35 +1,82 @@
 """PUBLIC_READ_ONLY live runner (Binance + Toobit public market data). User-run only.
 
 NOT executed by the tests or by the coding agent: tests inject fake REST/WebSocket transports.
-Nothing here signs requests, reads API keys, or touches order/account endpoints.
+Nothing here signs requests, reads API keys / .env, or touches order/account endpoints. Credentials that may
+exist in the environment are never read and never attached to a request.
 
-Run (examples; each needs explicit flags, otherwise it refuses to connect):
-  python -m src.stage0.live --source binance-futures --symbol BTCUSDT --seconds 30 --allow-binance-network --out live.jsonl
-  python -m src.stage0.live --source toobit-futures --symbol BTC-SWAP-USDT --seconds 30 \
-         --allow-toobit-network --i-approve-toobit-public-readonly --out live.jsonl
-  python -m src.stage0.live --check --source toobit-futures --symbol BTC-SWAP-USDT \
-         --allow-toobit-network --i-approve-toobit-public-readonly      # REST shape report vs the parsers
+Run (each needs explicit flags, otherwise the tool refuses to connect):
+  python -m src.stage0.live --check  --source binance-futures --symbol BTCUSDT --allow-binance-network
+  python -m src.stage0.live          --source binance-futures --symbol BTCUSDT --seconds 30 --allow-binance-network --out binance.jsonl
+  python -m src.stage0.live --check  --source toobit-futures --symbol BTC-SWAP-USDT --allow-toobit-network --i-approve-toobit-public-readonly
+  python -m src.stage0.live          --source toobit-futures --symbol BTC-SWAP-USDT --seconds 30 \
+         --allow-toobit-network --i-approve-toobit-public-readonly --out toobit.jsonl
+
+Exit codes: 0 completed healthy | 2 refused (no network permission/approval) | 3 required REST data unavailable
+            4 reconnect attempts exhausted | 5 data-integrity / internal error | 6 completed but UNHEALTHY
+            (no events, mostly unparsable, or long data stall) | (--check) 1 = at least one FAIL
 """
 import argparse
 import asyncio
 import json
+import random
 import sys
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .adapters import binance, toobit
-from .collector import (WS_URLS, Collector, NetworkDisabled, NetworkPolicy, PublicRestClient, ReconnectPolicy)
+from .collector import (BINANCE_FUTURES_WS, WS_ALLOWED, WS_URLS, Collector, HttpError, NetworkDisabled,
+                        NetworkPolicy, PublicRestClient, ReconnectPolicy, ResponseFormatError, TransportError)
 from .envelope import EnvelopeError, Source
-from .orderbook import BookState
+from .orderbook import BookState, LocalOrderBook
 from .symbols import binance_to_common, toobit_to_common
+
+EXIT_OK, EXIT_REFUSED, EXIT_STARTUP, EXIT_RECONNECT, EXIT_INTEGRITY, EXIT_UNHEALTHY = 0, 2, 3, 4, 5, 6
 
 
 class WsClosed(Exception):
     pass
 
 
+class StartupFailure(RuntimeError):
+    """A REQUIRED initial REST datum (server time / snapshot) is unavailable -> fail closed (exit 3)."""
+
+
+class ReconnectExhausted(RuntimeError):
+    """Reconnect attempts used up (exit 4)."""
+
+
+class ResyncExhausted(RuntimeError):
+    """Order-book resync attempts used up: persistent sequence/integrity trouble (exit 5)."""
+
+
+class FatalDataError(RuntimeError):
+    """Permanent protocol/data error that retrying cannot fix (exit 5)."""
+
+
+class RestFailure(Exception):
+    def __init__(self, endpoint: str, kind: str, status: Optional[int], attempts: int, reason: str):
+        super().__init__(f"{endpoint}: {kind} {status or ''} {reason}")
+        self.endpoint, self.kind, self.status, self.attempts, self.reason = endpoint, kind, status, attempts, reason
+
+    def record(self) -> dict:               # no params, headers or bodies: nothing sensitive
+        return {"endpoint": self.endpoint, "kind": self.kind, "status": self.status,
+                "attempts": self.attempts, "reason": self.reason}
+
+
+@dataclass
+class RestPolicy:
+    max_attempts: int = 4                    # total tries per request; never unbounded
+    base_s: float = 1.0
+    cap_s: float = 30.0
+    max_wait_s: float = 60.0                 # if the server asks to wait longer, give up instead of sleeping
+    jitter: Callable[[float], float] = lambda d: random.uniform(0.0, 0.25 * d)
+
+
 class WebsocketsConnection:                       # pragma: no cover - needs the network
-    """Default transport (pip install websockets). Imported lazily so tests/CI never need it."""
+    """Default transport (pip install websockets). Imported lazily so tests/CI never need it.
+    The library answers server pings with pongs automatically (Binance requires this)."""
 
     async def connect(self, url: str):
         import websockets
@@ -63,15 +110,11 @@ class PublicWsClient:
 
     async def open(self, source: Source, url: str):
         self.policy.check(source)                           # policy first, always
-        if not url.startswith(WS_URLS[source]):
-            raise NetworkDisabled(f"URL not under the allow-listed WebSocket endpoint: {url}")
+        if not any(url.startswith(p) for p in WS_ALLOWED[source]):
+            raise NetworkDisabled(f"URL not under an allow-listed WebSocket endpoint: {url}")
         conn = self.factory()
         await conn.connect(url)
         return conn
-
-
-class ResyncExhausted(RuntimeError):
-    pass
 
 
 def _utcnow():
@@ -82,120 +125,226 @@ class LiveRunner:
     def __init__(self, collector: Collector, rest: PublicRestClient, ws: PublicWsClient,
                  clock: Callable[[], datetime] = _utcnow, sleep=asyncio.sleep,
                  reconnect: Optional[ReconnectPolicy] = None, max_resyncs: int = 5,
-                 ping_interval_s: float = 30.0, idle_timeout_s: float = 20.0):
+                 ping_interval_s: float = 30.0, idle_timeout_s: float = 20.0,
+                 rest_policy: Optional[RestPolicy] = None):
         self.c, self.rest, self.ws, self.clock, self.sleep = collector, rest, ws, clock, sleep
         self.reconnect = reconnect or ReconnectPolicy()
+        self.rest_policy = rest_policy or RestPolicy()
         self.max_resyncs, self.ping_interval_s, self.idle_timeout_s = max_resyncs, ping_interval_s, idle_timeout_s
         self.reconnects = 0
         self.resyncs = 0
         self.network_calls = 0
+        self.rest_failures: List[dict] = []
+        self.rest_retries = 0
+        self.last_msg_at: Optional[datetime] = None
+        self.max_gap_s = 0.0
+        self.started_at: Optional[datetime] = None
 
-    # ------------------------------------------------------------------ REST helpers
-    async def _get(self, src, path, params=None):
-        self.network_calls += 1
-        return await asyncio.to_thread(self.rest.get, src, path, params)
+    # ------------------------------------------------------------------ REST with classification/backoff
+    def _server_wait(self, e: HttpError) -> Optional[float]:
+        """Rate-limit hints from the exchange itself, preferred over our own backoff."""
+        ra = e.headers.get("retry-after")
+        if ra is not None:
+            try:
+                return max(0.0, float(ra))
+            except ValueError:
+                pass
+        ts = e.headers.get("x-api-limit-reset-timestamp")            # Toobit: ms epoch of the next window
+        if ts is not None:
+            try:
+                return max(1.0, float(ts) / 1000.0 - self.clock().timestamp())
+            except ValueError:
+                pass
+        return None
+
+    async def _fetch(self, src: Source, path: str, params=None):
+        pol = self.rest_policy
+        last = None
+        for attempt in range(1, pol.max_attempts + 1):
+            self.network_calls += 1
+            try:
+                return await asyncio.to_thread(self.rest.get, src, path, params)
+            except NetworkDisabled:
+                raise
+            except HttpError as e:
+                if e.status == 429 or e.status == 418 or 500 <= e.status < 600:
+                    kind, wait = "TRANSIENT", self._server_wait(e) if e.status in (429, 418) else None
+                    last = (kind, e.status, f"HTTP {e.status}", wait)
+                else:        # 400/401/403(WAF)/404 ...: retrying the same request cannot help
+                    raise RestFailure(path, "PERMANENT", e.status, attempt, f"HTTP {e.status}")
+            except TransportError as e:
+                last = ("TRANSIENT", None, e.kind, None)
+            except ResponseFormatError as e:
+                raise RestFailure(path, "PERMANENT", None, attempt, "invalid JSON")
+            kind, status, reason, wait = last
+            if attempt >= pol.max_attempts:
+                break
+            delay = wait if wait is not None else min(pol.cap_s, pol.base_s * (2 ** (attempt - 1)))
+            delay += pol.jitter(delay)
+            if delay > pol.max_wait_s:
+                reason += f" (server asked to wait {delay:.0f}s > {pol.max_wait_s:.0f}s: giving up)"
+                break
+            self.rest_retries += 1
+            await self.sleep(delay)
+        raise RestFailure(path, last[0], last[1], attempt, reason)
+
+    def _note(self, f: RestFailure):
+        self.rest_failures.append(f.record())
 
     def _ingest_all(self, envs):
         for e in envs:
             self.c._ingest(e)
 
+    # ------------------------------------------------------------------ required: clock
     async def sync_clock(self, src: Source):
-        path = "/api/v1/time" if src == Source.TOOBIT_FUTURES else (
-            "/fapi/v1/time" if src == Source.BINANCE_FUTURES else "/api/v3/time")
+        """REQUIRED. Without a trustworthy exchange time the lag/future checks mean nothing -> fail closed."""
+        path = {Source.TOOBIT_FUTURES: "/api/v1/time", Source.BINANCE_FUTURES: "/fapi/v1/time"}.get(src, "/api/v3/time")
         t0 = self.clock()
-        raw = await self._get(src, path)
+        try:
+            raw = await self._fetch(src, path)
+        except RestFailure as f:
+            self._note(f)
+            raise StartupFailure(f"server time unavailable ({f.kind} {f.status or ''} {f.reason})")
         t1 = self.clock()
-        mid = t0 + (t1 - t0) / 2
-        off = int(raw["serverTime"]) - int(mid.timestamp() * 1000)
+        try:
+            st = int(raw["serverTime"])
+            if st <= 0:
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise StartupFailure("server time response has no valid 'serverTime'")
+        off = st - int((t0 + (t1 - t0) / 2).timestamp() * 1000)
         self.c.gate.on_clock_offset(src, off)
         return off
 
-    async def poll_reference(self, src: Source, symbol: str):
-        """One-shot REST reference data (funding, OI, contract spec ...). Failures are quarantined."""
-        calls = []
+    # ------------------------------------------------------------------ optional: reference data
+    def _reference_calls(self, src: Source, symbol: str):
         rx = self.clock
         if src == Source.TOOBIT_FUTURES:
-            calls = [("/api/v1/futures/fundingRate", {"symbol": symbol}, lambda r: toobit.parse_funding_rate(r, rx())),
-                     ("/quote/v1/openInterest", {"symbol": symbol}, lambda r: toobit.parse_open_interest(r, rx())),
-                     ("/quote/v1/markPrice", {"symbol": symbol}, lambda r: toobit.parse_mark_price(r, rx())),
-                     ("/quote/v1/index", {"symbol": symbol}, lambda r: toobit.parse_index_price(r, rx())),
-                     ("/quote/v1/contract/ticker/bookTicker", {"symbol": symbol}, lambda r: toobit.parse_book_ticker(r, rx())),
-                     ("/api/v1/exchangeInfo", None, lambda r: [e for e in toobit.parse_contracts(r, rx())
-                                                              if e.exchange_symbol == symbol])]
-        elif src == Source.BINANCE_FUTURES:
+            ts = toobit
+            return [("/api/v1/futures/fundingRate", {"symbol": symbol}, "FUNDING_RATE", lambda r: ts.parse_funding_rate(r, rx())),
+                    ("/quote/v1/openInterest", {"symbol": symbol}, "OPEN_INTEREST", lambda r: ts.parse_open_interest(r, rx())),
+                    ("/quote/v1/markPrice", {"symbol": symbol}, "MARK_PRICE", lambda r: ts.parse_mark_price(r, rx())),
+                    ("/quote/v1/index", {"symbol": symbol}, "INDEX_PRICE", lambda r: ts.parse_index_price(r, rx())),
+                    ("/api/v1/exchangeInfo", None, "CONTRACT_SPEC", lambda r: [e for e in ts.parse_contracts(r, rx())
+                                                                              if e.exchange_symbol == symbol])]
+        if src == Source.BINANCE_FUTURES:
             P = binance.FUTURES
-            calls = [("/fapi/v1/openInterest", {"symbol": symbol}, lambda r: [P.parse_open_interest(r, rx())]),
-                     ("/fapi/v1/fundingRate", {"symbol": symbol, "limit": 1}, lambda r: P.parse_funding_history(r, rx())),
-                     ("/futures/data/globalLongShortAccountRatio", {"symbol": symbol, "period": "5m", "limit": 1},
-                      lambda r: P.parse_long_short_ratio(r, rx()))]
-        else:
-            calls = [("/api/v3/ticker/price", {"symbol": symbol}, lambda r: [binance.SPOT.parse_price(r, rx())])]
-        for path, params, fn in calls:
+            return [("/fapi/v1/openInterest", {"symbol": symbol}, "OPEN_INTEREST", lambda r: [P.parse_open_interest(r, rx())]),
+                    ("/fapi/v1/fundingRate", {"symbol": symbol, "limit": 1}, "FUNDING_RATE", lambda r: P.parse_funding_history(r, rx())),
+                    ("/futures/data/globalLongShortAccountRatio", {"symbol": symbol, "period": "5m", "limit": 1},
+                     "LONG_SHORT_RATIO", lambda r: P.parse_long_short_ratio(r, rx()))]
+        return [("/api/v3/ticker/price", {"symbol": symbol}, "TICKER", lambda r: [binance.SPOT.parse_price(r, rx())])]
+
+    async def poll_reference(self, src: Source, symbol: str):
+        """Optional reference data. A failure is isolated (the stream keeps running) but is registered with
+        the gate: any consumer that needs that data type sees a missing type and never gets READY."""
+        common = toobit_to_common(symbol) if src == Source.TOOBIT_FUTURES else binance_to_common(
+            symbol, src == Source.BINANCE_FUTURES)
+        for path, params, etype, fn in self._reference_calls(src, symbol):
             try:
-                self._ingest_all(fn(await self._get(src, path, params)))
+                envs = fn(await self._fetch(src, path, params))
+                if not envs:
+                    raise EnvelopeError("response contained no usable item")
+                self._ingest_all(envs)
+            except RestFailure as f:
+                self._note(f)
+                self.c.gate.on_reference_failed(src, common, etype, f"{f.kind} {f.status or ''} {f.reason}")
             except (EnvelopeError, KeyError, ValueError, TypeError) as e:
                 self.c.rejected.append({"endpoint": path, "error": f"{type(e).__name__}: {e}"})
+                self.c.gate.on_reference_failed(src, common, etype, f"unparsable: {type(e).__name__}")
 
-    # ------------------------------------------------------------------ Binance
-    async def _binance_snapshot(self, src, symbol, common):
-        path = "/fapi/v1/depth" if src == Source.BINANCE_FUTURES else "/api/v3/depth"
-        P = binance.FUTURES if src == Source.BINANCE_FUTURES else binance.SPOT
-        raw = await self._get(src, path, {"symbol": symbol, "limit": 1000})
-        self.c._ingest(P.parse_depth_snapshot(symbol, raw, self.clock()))
+    # ------------------------------------------------------------------ stream bookkeeping
+    def _tick(self):
+        now = self.clock()
+        ref = self.last_msg_at or self.started_at
+        if ref is not None:
+            self.max_gap_s = max(self.max_gap_s, (now - ref).total_seconds())
+        self.last_msg_at = now
 
     def _begin_sync(self, src, common):
-        from .orderbook import LocalOrderBook
         b = self.c.books.setdefault((src, common), LocalOrderBook(src == Source.BINANCE_FUTURES))
         b.start_sync()
         self.c.gate.report_book(src, common, BookState.SYNCING)
 
-    async def run_binance(self, src: Source, symbol: str, duration_s: float):
-        futures = src == Source.BINANCE_FUTURES
-        common = binance_to_common(symbol, futures)
-        P = binance.FUTURES if futures else binance.SPOT
-        s = symbol.lower()
-        streams = [f"{s}@trade", f"{s}@bookTicker", f"{s}@depth@100ms"] + ([f"{s}@markPrice@1s"] if futures else [])
-        url = WS_URLS[src] + "?streams=" + "/".join(streams)
-        deadline = self.clock().timestamp() + duration_s
+    async def _binance_snapshot(self, src, symbol):
+        path = "/fapi/v1/depth" if src == Source.BINANCE_FUTURES else "/api/v3/depth"
+        P = binance.FUTURES if src == Source.BINANCE_FUTURES else binance.SPOT
+        raw = await self._fetch(src, path, {"symbol": symbol, "limit": 1000})
+        self.c._ingest(P.parse_depth_snapshot(symbol, raw, self.clock()))
+
+    async def _backoff_or_give_up(self, src, common, attempt, delays, why):
+        self.c.gate.on_disconnect(src)
+        self.reconnects += 1
+        if attempt >= len(delays):
+            self.c.gate.on_resync_failed(src, common, f"reconnect attempts exhausted: {why}")
+            raise ReconnectExhausted(why)
+        await self.sleep(delays[attempt])
+        return attempt + 1
+
+    # ------------------------------------------------------------------ Binance
+    async def _binance_conn(self, src, symbol, common, url, with_book, deadline):
+        P = binance.FUTURES if src == Source.BINANCE_FUTURES else binance.SPOT
         delays, attempt = self.reconnect.delays(), 0
         while self.clock().timestamp() < deadline:
             conn = None
             try:
                 conn = await self.ws.open(src, url)
-                self.c.gate.on_connect(src, [common])
-                self._begin_sync(src, common)
-                await self._binance_snapshot(src, symbol, common)
+                self.c.gate.on_connect(src, [common] if with_book else [])
+                if with_book:
+                    self._begin_sync(src, common)
+                    await self._binance_snapshot(src, symbol)
                 attempt = 0
                 while self.clock().timestamp() < deadline:
                     raw = await asyncio.wait_for(conn.recv(), timeout=self.idle_timeout_s)
-                    rx = self.clock()
+                    self._tick()
                     try:
-                        self._ingest_all(P.parse(json.loads(raw), rx))
+                        self._ingest_all(P.parse(json.loads(raw), self.clock()))
                     except (EnvelopeError, KeyError, ValueError, TypeError) as e:
                         self.c.rejected.append({"error": f"{type(e).__name__}: {e}"})
-                    b = self.c.books.get((src, common))
+                    b = self.c.books.get((src, common)) if with_book else None
                     if b is not None and b.state == BookState.INVALID:
                         self.resyncs += 1
                         if self.resyncs > self.max_resyncs:
                             self.c.gate.on_resync_failed(src, common, b.reason or "")
                             raise ResyncExhausted(b.reason)
                         self._begin_sync(src, common)
-                        await self._binance_snapshot(src, symbol, common)
+                        await self._binance_snapshot(src, symbol)
+            except RestFailure as f:                   # snapshot could not be fetched
+                self._note(f)
+                if f.kind == "PERMANENT":
+                    raise FatalDataError(f"depth snapshot rejected permanently: HTTP {f.status}")
+                attempt = await self._backoff_or_give_up(src, common, attempt, delays, f"snapshot: {f.reason}")
             except (WsClosed, asyncio.TimeoutError, OSError) as e:
-                self.c.gate.on_disconnect(src)
-                self.reconnects += 1
-                if attempt >= len(delays):
-                    self.c.gate.on_resync_failed(src, common, f"reconnect attempts exhausted: {e}")
-                    raise ResyncExhausted(str(e))
-                await self.sleep(delays[attempt])
-                attempt += 1
+                attempt = await self._backoff_or_give_up(src, common, attempt, delays, str(e) or type(e).__name__)
             finally:
                 if conn is not None:
                     await conn.close()
 
+    async def run_binance(self, src: Source, symbol: str, duration_s: float):
+        futures = src == Source.BINANCE_FUTURES
+        common = binance_to_common(symbol, futures)
+        s = symbol.lower()
+        deadline = self.clock().timestamp() + duration_s
+        if futures:       # routed endpoints: depth+bookTicker on /public, aggTrade+markPrice on /market
+            plan = [(BINANCE_FUTURES_WS["public"] + f"?streams={s}@bookTicker/{s}@depth@100ms", True),
+                    (BINANCE_FUTURES_WS["market"] + f"?streams={s}@aggTrade/{s}@markPrice@1s", False)]
+        else:
+            plan = [(WS_URLS[src] + f"?streams={s}@trade/{s}@bookTicker/{s}@depth@100ms", True)]
+        tasks = [asyncio.ensure_future(self._binance_conn(src, symbol, common, u, wb, deadline)) for u, wb in plan]
+        await self._fail_fast(tasks)
+
+    @staticmethod
+    async def _fail_fast(tasks):
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
     # ------------------------------------------------------------------ Toobit
-    async def run_toobit(self, symbol: str, duration_s: float,
-                         topics=("trade", "bookTicker", "markPrice", "depth")):
+    async def run_toobit(self, symbol: str, duration_s: float, topics=("trade", "bookTicker", "markPrice", "depth")):
         src = Source.TOOBIT_FUTURES
         common = toobit_to_common(symbol)
         deadline = self.clock().timestamp() + duration_s
@@ -219,80 +368,183 @@ class LiveRunner:
                             raise
                         await conn.send(json.dumps({"ping": int(self.clock().timestamp() * 1000)}))
                         continue
-                    rx = self.clock()
+                    self._tick()
                     try:
-                        self._ingest_all(toobit.parse_ws(json.loads(raw), rx))
+                        self._ingest_all(toobit.parse_ws(json.loads(raw), self.clock()))
                     except (EnvelopeError, KeyError, ValueError, TypeError) as e:
                         self.c.rejected.append({"error": f"{type(e).__name__}: {e}"})
             except (WsClosed, asyncio.TimeoutError, OSError) as e:
-                self.c.gate.on_disconnect(src)
-                self.reconnects += 1
-                if attempt >= len(delays):
-                    self.c.gate.on_resync_failed(src, common, f"reconnect attempts exhausted: {e}")
-                    raise ResyncExhausted(str(e))
-                await self.sleep(delays[attempt])
-                attempt += 1
+                attempt = await self._backoff_or_give_up(src, common, attempt, delays, str(e) or type(e).__name__)
             finally:
                 if conn is not None:
                     await conn.close()
 
     async def run(self, src: Source, symbol: str, duration_s: float):
-        await self.sync_clock(src)
-        await self.poll_reference(src, symbol)
+        self.started_at = self.clock()
+        await self.sync_clock(src)                 # required (StartupFailure)
+        await self.poll_reference(src, symbol)     # optional (isolated, but registered with the gate)
         if src == Source.TOOBIT_FUTURES:
             await self.run_toobit(symbol, duration_s)
         else:
             await self.run_binance(src, symbol, duration_s)
 
+    # ------------------------------------------------------------------ verdict
+    def health(self, stall_s: float = 20.0) -> Tuple[int, List[str]]:
+        """Exit code for a run that ended WITHOUT an exception. A run that produced nothing useful is not success."""
+        reasons = []
+        n_ev, n_bad = len(self.c.envelopes), len(self.c.rejected)
+        end_gap = ((self.clock() - self.last_msg_at).total_seconds() if self.last_msg_at else 0.0)
+        gap = max(self.max_gap_s, end_gap)
+        if n_ev == 0:
+            reasons.append("no events collected")
+        if n_ev + n_bad and n_bad / (n_ev + n_bad) > 0.5:
+            reasons.append(f"{n_bad} of {n_ev + n_bad} messages could not be parsed")
+        if gap > stall_s:
+            reasons.append(f"data stalled for {gap:.0f}s (> {stall_s:.0f}s)")
+        return (EXIT_UNHEALTHY if reasons else EXIT_OK), reasons
+
 
 # ---------------------------------------------------------------------- REST shape check (user-run)
-async def check_rest(rest: PublicRestClient, src: Source, symbol: str) -> List[dict]:
-    """Calls each documented public REST endpoint ONCE, runs the parser, and reports top-level keys
-    and parse success. It records shapes, not data. Use it to compare reality with the docs."""
-    rx = _utcnow()
-    if src == Source.TOOBIT_FUTURES:
-        T = [("/api/v1/time", None, None),
-             ("/quote/v1/contract/ticker/price", {"symbol": symbol}, lambda r: toobit.parse_ticker_price(r, rx)),
-             ("/quote/v1/trades", {"symbol": symbol, "limit": 5}, lambda r: toobit.parse_trades(symbol, r, rx)),
-             ("/quote/v1/depth", {"symbol": symbol, "limit": 5}, lambda r: [toobit.parse_depth(symbol, r, rx)]),
-             ("/quote/v1/contract/ticker/bookTicker", {"symbol": symbol}, lambda r: toobit.parse_book_ticker(r, rx)),
-             ("/quote/v1/markPrice", {"symbol": symbol}, lambda r: toobit.parse_mark_price(r, rx)),
-             ("/quote/v1/index", {"symbol": symbol}, lambda r: toobit.parse_index_price(r, rx)),
-             ("/api/v1/futures/fundingRate", {"symbol": symbol}, lambda r: toobit.parse_funding_rate(r, rx)),
-             ("/quote/v1/openInterest", {"symbol": symbol}, lambda r: toobit.parse_open_interest(r, rx)),
-             ("/api/v1/exchangeInfo", None, lambda r: toobit.parse_contracts(r, rx))]
+PASS, FAIL, INCONCLUSIVE = "PASS", "FAIL", "INCONCLUSIVE"
+
+EXPECTED_KEYS = {   # documented top-level (dict) or first-item (list) keys; extra keys are reported, not failed
+    "binance:time": {"serverTime"},
+    "binance:price": {"symbol", "price"},
+    "binance:depth": {"lastUpdateId", "bids", "asks"},
+    "binance:oi": {"symbol", "openInterest", "time"},
+    "binance:funding": {"symbol", "fundingRate", "fundingTime"},
+    "binance:ratio": {"symbol", "longShortRatio", "longAccount", "shortAccount", "timestamp"},
+    "toobit:time": {"serverTime"},
+    "toobit:price": {"s", "p"},
+    "toobit:trades": {"p", "q", "t", "ibm"},
+    "toobit:depth": {"t", "b", "a"},
+    "toobit:bookTicker": {"t", "s", "b", "bq", "a", "aq"},
+    "toobit:markPrice": {"exchangeId", "symbolId", "price", "time"},
+    "toobit:index": {"index", "edp"},
+    "toobit:funding": {"symbol", "rate", "period", "nextFundingTime", "interest", "fundingRateCap", "fundingRateFloor"},
+    "toobit:oi": {"openInterestList"},
+    "toobit:exchangeInfo": {"contracts"},
+}
+
+
+def _is_empty(raw) -> bool:
+    return raw is None or raw == [] or raw == {}
+
+
+def _first_keys(raw) -> Optional[set]:
+    if isinstance(raw, dict):
+        return set(raw)
+    if isinstance(raw, list) and raw and isinstance(raw[0], dict):
+        return set(raw[0])
+    return None
+
+
+async def check_rest(rest: PublicRestClient, src: Source, symbol: str, now: Callable[[], datetime] = _utcnow) -> List[dict]:
+    """One request per documented public REST endpoint, then PASS / FAIL / INCONCLUSIVE:
+      PASS          response received, required structure present, parser produced events, data non-empty
+      FAIL          request failed (HTTP/transport) or the structure contradicts the parser's expectation
+      INCONCLUSIVE  empty response / no events / docs leave the meaning or unit open (never auto-promoted)
+    Reports shapes and counts only - never response values (apart from the clock offset) and no credentials."""
+    rx = now()
+    tb = src == Source.TOOBIT_FUTURES
+    if tb:
+        T = [("/api/v1/time", None, "toobit:time", None, None),
+             ("/quote/v1/contract/ticker/price", {"symbol": symbol}, "toobit:price", lambda r: toobit.parse_ticker_price(r, rx), "rest_ticker_price"),
+             ("/quote/v1/trades", {"symbol": symbol, "limit": 5}, "toobit:trades", lambda r: toobit.parse_trades(symbol, r, rx), "rest_trades"),
+             ("/quote/v1/depth", {"symbol": symbol, "limit": 5}, "toobit:depth", lambda r: [toobit.parse_depth(symbol, r, rx)], "rest_depth"),
+             ("/quote/v1/contract/ticker/bookTicker", {"symbol": symbol}, "toobit:bookTicker", lambda r: toobit.parse_book_ticker(r, rx), "rest_book_ticker"),
+             ("/quote/v1/markPrice", {"symbol": symbol}, "toobit:markPrice", lambda r: toobit.parse_mark_price(r, rx), "rest_mark_price"),
+             ("/quote/v1/index", {"symbol": symbol}, "toobit:index", lambda r: toobit.parse_index_price(r, rx), "rest_index_price"),
+             ("/api/v1/futures/fundingRate", {"symbol": symbol}, "toobit:funding", lambda r: toobit.parse_funding_rate(r, rx), "rest_funding_rate"),
+             ("/quote/v1/openInterest", {"symbol": symbol}, "toobit:oi", lambda r: toobit.parse_open_interest(r, rx), "rest_open_interest"),
+             ("/api/v1/exchangeInfo", None, "toobit:exchangeInfo",
+              lambda r: [e for e in toobit.parse_contracts(r, rx) if e.exchange_symbol == symbol], "rest_contract")]
     else:
         fut = src == Source.BINANCE_FUTURES
         P = binance.FUTURES if fut else binance.SPOT
         pre = "/fapi/v1" if fut else "/api/v3"
-        T = [(pre + "/time", None, None),
-             (pre + "/ticker/price", {"symbol": symbol}, lambda r: [P.parse_price(r, rx)]),
-             (pre + "/depth", {"symbol": symbol, "limit": 5}, lambda r: [P.parse_depth_snapshot(symbol, r, rx)])]
+        T = [(pre + "/time", None, "binance:time", None, None),
+             (pre + "/ticker/price", {"symbol": symbol}, "binance:price", lambda r: [P.parse_price(r, rx)], None),
+             (pre + "/depth", {"symbol": symbol, "limit": 5}, "binance:depth", lambda r: [P.parse_depth_snapshot(symbol, r, rx)], None)]
         if fut:
-            T += [("/fapi/v1/openInterest", {"symbol": symbol}, lambda r: [P.parse_open_interest(r, rx)]),
-                  ("/fapi/v1/fundingRate", {"symbol": symbol, "limit": 1}, lambda r: P.parse_funding_history(r, rx)),
+            T += [("/fapi/v1/openInterest", {"symbol": symbol}, "binance:oi", lambda r: [P.parse_open_interest(r, rx)], None),
+                  ("/fapi/v1/fundingRate", {"symbol": symbol, "limit": 1}, "binance:funding", lambda r: P.parse_funding_history(r, rx), None),
                   ("/futures/data/globalLongShortAccountRatio", {"symbol": symbol, "period": "5m", "limit": 1},
-                   lambda r: P.parse_long_short_ratio(r, rx))]
+                   "binance:ratio", lambda r: P.parse_long_short_ratio(r, rx), None)]
     out = []
-    for path, params, fn in T:
-        row = {"endpoint": path, "ok": False}
+    for path, params, ek, fn, vkey in T:
+        row = {"endpoint": path, "verdict": FAIL, "request_ok": False, "http_status": None}
         try:
             raw = await asyncio.to_thread(rest.get, src, path, params)
-            row["top_level"] = sorted(raw) if isinstance(raw, dict) else f"array[{len(raw)}]"
-            if isinstance(raw, list) and raw and isinstance(raw[0], dict):
-                row["first_item_keys"] = sorted(raw[0])
-            n = len(fn(raw)) if fn else 0
-            row.update(ok=True, parsed_events=n)
-        except Exception as e:
-            row["error"] = f"{type(e).__name__}: {e}"
+            row.update(request_ok=True, http_status=200)
+        except NetworkDisabled:
+            raise
+        except HttpError as e:
+            row.update(http_status=e.status, reason=("rate limited" if e.status == 429 else
+                                                     "server error" if e.status >= 500 else "request rejected"))
+            out.append(row)
+            continue
+        except TransportError as e:
+            row["reason"] = f"transport error: {e.kind}"
+            out.append(row)
+            continue
+        except ResponseFormatError:
+            row["reason"] = "response is not valid JSON"
+            out.append(row)
+            continue
+        row["top_level"] = sorted(raw) if isinstance(raw, dict) else f"array[{len(raw)}]" if isinstance(raw, list) else type(raw).__name__
+        keys = _first_keys(raw)
+        if keys is not None:
+            exp = EXPECTED_KEYS[ek]
+            row["extra_keys"] = sorted(keys - exp)
+            row["missing_keys"] = sorted(exp - keys)
+        if fn is None:                                  # /time: validate the field itself
+            try:
+                off = int(raw["serverTime"]) - int(rx.timestamp() * 1000)
+            except (KeyError, TypeError, ValueError):
+                row.update(reason="serverTime missing or not an integer")
+            else:
+                row["clock_offset_ms"] = off
+                if abs(off) > 300_000:
+                    row.update(verdict=INCONCLUSIVE, reason=f"structure OK but server time differs from local by {off} ms")
+                else:
+                    row.update(verdict=PASS, reason="serverTime present and plausible")
+            out.append(row)
+            continue
+        if _is_empty(raw):
+            row.update(verdict=INCONCLUSIVE, parsed_events=0, reason="empty response: nothing to validate")
+            out.append(row)
+            continue
+        try:
+            n = len(fn(raw))
+        except (EnvelopeError, KeyError, ValueError, TypeError) as e:
+            row.update(parsed_events=None, reason=f"structure does not match parser: {type(e).__name__}: {e}")
+            out.append(row)
+            continue
+        row["parsed_events"] = n
+        if n == 0:
+            row.update(verdict=INCONCLUSIVE, reason="parsed OK but produced no events for this symbol")
+        elif vkey and toobit.VERIFICATION.get(vkey) == toobit.UNVERIFIED:
+            row.update(verdict=INCONCLUSIVE, structure=PASS,
+                       reason="structure matches the parser, but docs leave unit/symbol meaning open (stays UNVERIFIED)")
+        else:
+            row.update(verdict=PASS, structure=PASS,
+                       reason="structure matches parser" + ("; semantics are DOC-level only (not independently verified)" if tb else
+                                                             "; values not independently verified"))
         out.append(row)
     return out
 
 
 def build_policy(args) -> NetworkPolicy:
-    pol = NetworkPolicy(allow_binance=args.allow_binance_network, allow_toobit=args.allow_toobit_network,
-                        toobit_user_approved=args.i_approve_toobit_public_readonly)
-    return pol
+    return NetworkPolicy(allow_binance=args.allow_binance_network, allow_toobit=args.allow_toobit_network,
+                         toobit_user_approved=args.i_approve_toobit_public_readonly)
+
+
+def _write(out, col):
+    if out:
+        with open(out, "w", encoding="utf-8") as fh:
+            for e in col.envelopes:
+                fh.write(e.to_json() + "\n")
 
 
 def main(argv=None) -> int:
@@ -301,7 +553,8 @@ def main(argv=None) -> int:
     ap.add_argument("--symbol", required=True, help="EXCHANGE symbol, e.g. BTCUSDT or BTC-SWAP-USDT")
     ap.add_argument("--seconds", type=float, default=30)
     ap.add_argument("--out", default=None, help="write envelopes as JSONL")
-    ap.add_argument("--check", action="store_true", help="REST shape report vs parsers; no streaming")
+    ap.add_argument("--check", action="store_true", help="REST shape report (PASS/FAIL/INCONCLUSIVE); no streaming")
+    ap.add_argument("--stall-seconds", type=float, default=20.0, help="data gap treated as unhealthy")
     ap.add_argument("--allow-binance-network", action="store_true")
     ap.add_argument("--allow-toobit-network", action="store_true")
     ap.add_argument("--i-approve-toobit-public-readonly", action="store_true",
@@ -313,25 +566,47 @@ def main(argv=None) -> int:
         pol.check(src)
     except NetworkDisabled as e:
         print(f"REFUSED: {e}. Add the explicit flag(s) described in the module docstring.", file=sys.stderr)
-        return 2
+        return EXIT_REFUSED
     rest = PublicRestClient(pol)
     if args.check:
-        rep = asyncio.run(check_rest(rest, src, args.symbol))
-        print(json.dumps(rep, indent=2))
-        return 0 if all(r["ok"] for r in rep) else 1
+        try:
+            rep = asyncio.run(check_rest(rest, src, args.symbol))
+        except NetworkDisabled as e:
+            print(f"REFUSED: {e}", file=sys.stderr)
+            return EXIT_REFUSED
+        counts = Counter(r["verdict"] for r in rep)
+        print(json.dumps({"summary": dict(counts), "endpoints": rep}, indent=2))
+        return 1 if counts.get(FAIL) else 0
     col = Collector()
     runner = LiveRunner(col, rest, PublicWsClient(pol))
+    code, reasons, err = EXIT_OK, [], None
     try:
         asyncio.run(runner.run(src, args.symbol, args.seconds))
-    except ResyncExhausted as e:
-        print(f"STOPPED: {e}", file=sys.stderr)
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as fh:
-            for e in col.envelopes:
-                fh.write(e.to_json() + "\n")
-    print(json.dumps({"envelopes": len(col.envelopes), "rejected": len(col.rejected), "issues": col.gate.kinds(),
-                      "reconnects": runner.reconnects, "resyncs": runner.resyncs}, indent=2))
-    return 0
+        code, reasons = runner.health(args.stall_seconds)
+    except NetworkDisabled as e:
+        code, err = EXIT_REFUSED, f"network not permitted: {e}"
+    except StartupFailure as e:
+        code, err = EXIT_STARTUP, f"required REST data unavailable: {e}"
+    except ReconnectExhausted as e:
+        code, err = EXIT_RECONNECT, f"reconnect attempts exhausted: {e}"
+    except (ResyncExhausted, FatalDataError) as e:
+        code, err = EXIT_INTEGRITY, f"data integrity: {type(e).__name__}: {e}"
+    except Exception as e:                                  # internal error: never report as success
+        code, err = EXIT_INTEGRITY, f"internal error: {type(e).__name__}"
+    _write(args.out, col)
+    common = toobit_to_common(args.symbol) if src == Source.TOOBIT_FUTURES else binance_to_common(
+        args.symbol, src == Source.BINANCE_FUTURES)
+    print(json.dumps({"exit_code": code, "error": err, "unhealthy_reasons": reasons,
+                      "envelopes": len(col.envelopes), "rejected": len(col.rejected),
+                      "issues": dict(Counter(col.gate.kinds())), "reconnects": runner.reconnects,
+                      "resyncs": runner.resyncs, "rest_retries": runner.rest_retries,
+                      "rest_failures": runner.rest_failures, "max_gap_s": round(runner.max_gap_s, 1),
+                      "final_per_type": col.gate.explain(src, common, runner.clock())}, indent=2))
+    if err:
+        print(f"FAILED: {err}", file=sys.stderr)
+    elif reasons:
+        print("UNHEALTHY: " + "; ".join(reasons), file=sys.stderr)
+    return code
 
 
 if __name__ == "__main__":

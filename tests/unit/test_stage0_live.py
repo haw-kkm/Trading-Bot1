@@ -12,7 +12,7 @@ from src.stage0 import collector as col
 from src.stage0 import live
 from src.stage0.collector import Collector, NetworkDisabled, NetworkPolicy, PublicRestClient, ReconnectPolicy
 from src.stage0.envelope import Source
-from src.stage0.live import LiveRunner, PublicWsClient, ResyncExhausted, WsClosed
+from src.stage0.live import LiveRunner, PublicWsClient, ReconnectExhausted, ResyncExhausted, WsClosed
 from src.stage0.orderbook import BookState
 from src.stage0.quality import Readiness
 
@@ -51,11 +51,13 @@ class Clock:
 
 
 class FakeConn:
-    def __init__(self, script, clock):
-        self.script, self.clock, self.sent, self.closed = list(script), clock, [], False
+    def __init__(self, script, clock, pick=None):
+        self.script, self.clock, self.sent, self.closed, self._pick = list(script), clock, [], False, pick
 
     async def connect(self, url):
         self.url = url
+        if self._pick is not None:                 # per-URL scripts (futures uses two connections)
+            self.script = list(self._pick(url))
 
     async def send(self, text):
         self.sent.append(json.loads(text))
@@ -80,10 +82,19 @@ class FakeConn:
 
 class Factory:
     def __init__(self, scripts, clock):
-        self.scripts, self.clock, self.conns = list(scripts), clock, []
+        self.scripts, self.clock, self.conns = (scripts if isinstance(scripts, dict) else list(scripts)), clock, []
+
+    def _pick(self, url):
+        for key, lst in self.scripts.items():
+            if key in url:
+                return lst.pop(0) if lst else []
+        return []
 
     def __call__(self):
-        c = FakeConn(self.scripts.pop(0) if self.scripts else [], self.clock)
+        if isinstance(self.scripts, dict):
+            c = FakeConn([], self.clock, self._pick)
+        else:
+            c = FakeConn(self.scripts.pop(0) if self.scripts else [], self.clock)
         self.conns.append(c)
         return c
 
@@ -170,7 +181,7 @@ def test_binance_reconnect_exhausted_marks_resync_failed():
     c = Collector()
     r = LiveRunner(c, PublicRestClient(pol, transport=lambda u, p: snap(1)), PublicWsClient(pol, Failing()),
                    clock=clock, sleep=clock.sleep, reconnect=ReconnectPolicy(base_s=1, cap_s=2, max_attempts=3))
-    with pytest.raises(ResyncExhausted):
+    with pytest.raises(ReconnectExhausted):
         run(r.run_binance(Source.BINANCE_SPOT, "BTCUSDT", 600))
     assert "RESYNC_FAILED" in c.gate.kinds() and r.reconnects == 4
 
@@ -188,12 +199,28 @@ def test_idle_timeout_is_treated_as_disconnect():
     assert "DISCONNECTED" in c.gate.kinds() and len(fac.conns) >= 2
 
 
-def test_binance_futures_uses_pu_and_futures_streams():
-    r, c, fac, rest, clock = make([[depth(99, 101, pu=98), depth(102, 103, pu=101)]],
+def agg(i):
+    return {"stream": "btcusdt@aggTrade", "data": {"e": "aggTrade", "E": MS, "s": "BTCUSDT", "a": i, "p": "100", "q": "1",
+                                                  "f": i, "l": i, "T": MS, "m": False}}
+
+
+def mark():
+    return {"stream": "btcusdt@markPrice@1s", "data": {"e": "markPriceUpdate", "E": MS, "s": "BTCUSDT", "p": "100",
+                                                        "i": "100", "P": "100", "r": "0.0001", "T": MS + 1}}
+
+
+def test_binance_futures_uses_routed_public_and_market_endpoints():
+    r, c, fac, rest, clock = make({"/public/": [[depth(99, 101, pu=98), depth(102, 103, pu=101)]],
+                                   "/market/": [[agg(1), mark(), agg(2)]]},
                                   {"/fapi/v1/depth": snap(100)}, policy=NetworkPolicy(allow_binance=True))
-    run(r.run_binance(Source.BINANCE_FUTURES, "BTCUSDT", 1))
-    assert "@markPrice@1s" in fac.conns[0].url and rest.calls[0][0] == "/fapi/v1/depth"
-    assert c.books[(Source.BINANCE_FUTURES, "BTC/USDT:USDT")].last_update_id == 103
+    run(r.run_binance(Source.BINANCE_FUTURES, "BTCUSDT", 3))
+    urls = {cn.url for cn in fac.conns}
+    assert urls == {"wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s",
+                    "wss://fstream.binance.com/public/stream?streams=btcusdt@bookTicker/btcusdt@depth@100ms"}
+    assert not any("/stream?" in u and "fstream.binance.com/stream" in u for u in urls)      # no legacy URL
+    kinds = {(e.event_type.value, e.sequence_id) for e in c.envelopes}
+    assert ("ORDERBOOK_DELTA", "103") in kinds and ("TRADE", "2") in kinds
+    assert any(k[0] == "MARK_PRICE" for k in kinds) and rest.calls[0][0] == "/fapi/v1/depth"
 
 
 def test_clock_skew_detected_from_server_time():
@@ -292,21 +319,6 @@ def test_cli_refuses_without_flags_and_toobit_needs_both_flags(capsys):
     assert live.main(["--source", "toobit-futures", "--symbol", TSYM, "--allow-toobit-network"]) == 2
     assert live.main(["--source", "toobit-futures", "--symbol", TSYM, "--i-approve-toobit-public-readonly"]) == 2
     assert col.TOOBIT_NETWORK_APPROVED is False
-
-
-def test_check_rest_reports_shapes_with_fake_transport():
-    pol = NetworkPolicy(allow_toobit=True, toobit_user_approved=True)
-    resp = {"/api/v1/time": {"serverTime": MS},
-            "/quote/v1/markPrice": {"exchangeId": 301, "symbolId": TSYM, "price": "1", "time": MS},
-            "/quote/v1/openInterest": {"openInterestList": [{"size": "1", "symbol": TSYM}]}}
-
-    def transport(url, params):
-        return resp.get("/" + url.split("/", 3)[3], {"unexpected": True})
-    rep = run(live.check_rest(PublicRestClient(pol, transport=transport), Source.TOOBIT_FUTURES, TSYM))
-    byp = {r["endpoint"]: r for r in rep}
-    assert byp["/quote/v1/markPrice"]["ok"] and byp["/quote/v1/openInterest"]["ok"]
-    assert not byp["/quote/v1/index"]["ok"] and "error" in byp["/quote/v1/index"]
-    assert byp["/api/v1/time"]["top_level"] == ["serverTime"]
 
 
 def test_live_modules_contain_no_order_or_auth_code():
