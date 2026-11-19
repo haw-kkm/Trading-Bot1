@@ -1,0 +1,3 @@
+--- 002_entry_gate.sql
+PATTERN: IF \(SELECT frozen FROM entry_control WHERE id = 1\) THEN
+REPLACED WITH: IF FALSE THEN

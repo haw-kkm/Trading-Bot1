@@ -1,0 +1,20 @@
+{
+  "commit": "7869c141e58ab56cba1e1c1dcf75144427143fb1",
+  "baseline": {
+    "returncode": 0,
+    "summary": "118 passed in 173.64s (0:02:53)",
+    "tests": [
+      "tests/unit/test_p1_1_lifecycle_fills.py",
+      "tests/unit/test_p1_2_reset_risk_mitigation.py",
+      "tests/unit/test_trackA_entry_gate_concurrency.py",
+      "tests/unit/test_trackA_pg_safety.py"
+    ]
+  },
+  "all_mutants_killed": true
+}
+  advisory_lock_removed: KILLED  1 failed in 31.17s
+  entry_gate_trigger_disabled: KILLED  1 failed, 13 passed in 43.28s
+  release_guard_disabled: KILLED  1 failed, 17 passed in 39.94s
+  fill_decrease_guard_disabled: KILLED  1 failed, 32 passed in 55.38s
+  fill_uniqueness_removed: KILLED  1 failed, 27 passed in 52.80s
+mutation rc=0

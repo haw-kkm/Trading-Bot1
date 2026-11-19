@@ -1,0 +1,25 @@
+F
+================================== FAILURES ===================================
+__ test_entry_blocked_when_unknown_transition_is_uncommitted_and_lands_first __
+
+store = <src.orders.pg_store.OrderStore object at 0x0000022C622BD940>
+pg_dsn = 'postgresql://postgres:@127.0.0.1:60484/postgres'
+
+    def test_entry_blocked_when_unknown_transition_is_uncommitted_and_lands_first(store, pg_dsn):
+        pending = _pending_exit(store)
+        _issue_entry(store, "E1")
+        sent = []
+        sub = SafeSubmitter(store, _ok_sender(sent))
+        a = OpenTx(pg_dsn, TO_UNKNOWN, (pending.intent_id,))       # A: UNKNOWN written, NOT committed
+        b = Runner(lambda: sub.submit("E1"))
+        b.start()
+>       assert _wait_for_advisory_waiter(pg_dsn), "B was not serialized behind A's gate lock"
+E       AssertionError: B was not serialized behind A's gate lock
+E       assert False
+E        +  where False = _wait_for_advisory_waiter('postgresql://postgres:@127.0.0.1:60484/postgres')
+
+tests\unit\test_trackA_entry_gate_concurrency.py:116: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/unit/test_trackA_entry_gate_concurrency.py::test_entry_blocked_when_unknown_transition_is_uncommitted_and_lands_first
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed in 31.17s
