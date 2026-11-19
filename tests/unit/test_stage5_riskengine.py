@@ -74,7 +74,7 @@ def test_risk_engine_reject_under_drawdown():
     import src.core.risk_engine
     original_global_check = src.core.risk_engine.RiskEngine._global_hard_limit_check
 
-    def mock_global_check(self, hypothesis):
+    def mock_global_check(self, hypothesis, reduce_only=False):
         return {
             "status": "REJECTED",
             "reason": "RISK_REJECTED: Account under drawdown circuit breaker"
@@ -111,7 +111,7 @@ def test_risk_engine_clamp_excessive_position():
     import src.core.risk_engine
     original_global_check = src.core.risk_engine.RiskEngine._global_hard_limit_check
 
-    def mock_global_check(self, hypothesis):
+    def mock_global_check(self, hypothesis, reduce_only=False):
         return {
             "status": "APPROVED",
             "max_allowed_position": 5000.0  # Small max position
@@ -148,7 +148,7 @@ def test_risk_engine_accept_valid_hypothesis():
     import src.core.risk_engine
     original_global_check = src.core.risk_engine.RiskEngine._global_hard_limit_check
 
-    def mock_global_check(self, hypothesis):
+    def mock_global_check(self, hypothesis, reduce_only=False):
         return {
             "status": "APPROVED",
             "max_allowed_position": 100000.0  # Large enough for any reasonable position

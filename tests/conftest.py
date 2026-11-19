@@ -25,6 +25,7 @@ def _reset_tables(dsn: str) -> None:
     import psycopg
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute("TRUNCATE order_events, order_intents, authorizations RESTART IDENTITY CASCADE")
+        c.execute("TRUNCATE account_equity")
         c.execute("UPDATE entry_control SET frozen=FALSE, reason=NULL, frozen_at=NULL WHERE id=1")
 
 
@@ -57,6 +58,20 @@ def _default_engine_store(request):
     ExecutionEngine.default_store_factory = factory
     yield
     ExecutionEngine.default_store_factory = None
+
+
+@pytest.fixture(autouse=True)
+def _default_account_source():
+    """TEST WIRING ONLY: a healthy PaperExchange-backed equity source so legacy RiskEngine()
+    tests keep working. Production has no such default (ENTRY fails closed without a source)."""
+    from src.core.account_equity import EquityTracker, PgEquityStore
+    from src.core.risk_engine import RiskEngine
+    from tests.support.paper_exchange import PaperExchange
+    _server_dsn()
+    ex = PaperExchange()
+    RiskEngine.default_equity_tracker = EquityTracker(ex.get_account_equity, PgEquityStore(_state["dsn"]))
+    yield
+    RiskEngine.default_equity_tracker = None
 
 
 def pytest_sessionfinish(session, exitstatus):

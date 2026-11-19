@@ -173,6 +173,12 @@ class ExecutionEngine:
             )
 
     @staticmethod
+    def _require_entry_token(vo: ValidatedOrder) -> None:
+        if vo.reduce_only:
+            raise UnauthorizedExecutionError(
+                "execution refused: reduce-only token cannot authorize a new ENTRY")
+
+    @staticmethod
     def _same(a: Optional[float], b: Optional[float]) -> bool:
         if a is None or b is None:
             return a is b
@@ -318,6 +324,7 @@ class ExecutionEngine:
         """IOC (ENTRY purpose). Refused during emergency lock / entry freeze."""
         self._require_token(validated_order)
         self._bind(validated_order, symbol, side, price=price)
+        self._require_entry_token(validated_order)
         quantity = validated_order.quantity
         out = self._submit_order(OrderPurpose.ENTRY, "IOC", symbol, side, quantity, price,
                                  self._auth_id(validated_order), True)
@@ -337,6 +344,7 @@ class ExecutionEngine:
         An API timeout / lost response is SUBMISSION_UNKNOWN: no rollback, no resend."""
         self._require_token(validated_order)
         self._bind(validated_order, symbol, side)
+        self._require_entry_token(validated_order)
         quantity = validated_order.quantity
         out = self._submit_order(OrderPurpose.ENTRY, "MARKET", symbol, side, quantity,
                                  validated_order.price, self._auth_id(validated_order), True)

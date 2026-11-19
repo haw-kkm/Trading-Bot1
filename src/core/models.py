@@ -217,11 +217,14 @@ class ValidatedOrder:
     # Unique per issued token (signed). Local one-time-use key; NOT an exchange
     # exactly-once guarantee. Default "" keeps legacy/forged constructions valid.
     authorization_id: str = ""
+    # Signed: a token issued for a risk-REDUCING order skips the equity gate, so it must never
+    # be usable to authorize a new ENTRY.
+    reduce_only: bool = False
 
     @staticmethod
     def canonical_payload(
         symbol, side, quantity, leverage, price, stop_loss, take_profit,
-        hypothesis_id, status, original_quantity, authorization_id="",
+        hypothesis_id, status, original_quantity, authorization_id="", reduce_only=False,
     ) -> bytes:
         """Canonical byte form of the execution-critical fields (to be MAC'd).
 
@@ -241,6 +244,7 @@ class ValidatedOrder:
                 "status": status,
                 "original_quantity": original_quantity,
                 "authorization_id": authorization_id,
+                "reduce_only": bool(reduce_only),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -251,5 +255,5 @@ class ValidatedOrder:
         return self.canonical_payload(
             self.symbol, self.side, self.quantity, self.leverage, self.price,
             self.stop_loss, self.take_profit, self.hypothesis_id, self.status,
-            self.original_quantity, self.authorization_id,
+            self.original_quantity, self.authorization_id, self.reduce_only,
         )

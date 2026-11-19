@@ -10,7 +10,8 @@ import json
 import os
 import secrets
 import uuid
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Optional, Tuple
+from src.core.account_equity import AccountDataUnavailable, EquityTracker
 from src.core.models import TradeHypothesis, ValidatedOrder
 
 
@@ -42,8 +43,14 @@ class RiskEngine:
     def _sign(cls, payload: bytes) -> str:
         return hmac.new(cls._SIGNING_KEY, payload, hashlib.sha256).hexdigest()
 
-    def __init__(self):
+    # Process-wide default account source (set by application wiring; tests set it in
+    # conftest). With none configured, ENTRY validation fails closed: there is NO simulated
+    # equity fallback any more.
+    default_equity_tracker: Optional[EquityTracker] = None
+
+    def __init__(self, equity_tracker: Optional[EquityTracker] = None):
         """Initialize RiskEngine with config file path."""
+        self.equity_tracker = equity_tracker
         self.config_path = "config/risk-limits.json"
         self._load_limits()
         self._verify_checksum()
@@ -95,7 +102,7 @@ class RiskEngine:
             )
         return True
 
-    def validate_trade(self, hypothesis: TradeHypothesis) -> Dict[str, Any]:
+    def validate_trade(self, hypothesis: TradeHypothesis, reduce_only: bool = False) -> Dict[str, Any]:
         """Validate a trade hypothesis through the deterministic pipeline.
 
         On APPROVED or CLAMPED, this method issues an immutable
@@ -106,6 +113,10 @@ class RiskEngine:
 
         Args:
             hypothesis: TradeHypothesis to validate
+            reduce_only: the order only reduces an existing position (EXIT/EMERGENCY_REDUCE).
+                Such orders are NOT blocked by the account-equity gate (drawdown breach or
+                account-data failure); the issued token is signed reduce_only and can never
+                authorize an ENTRY.
 
         Returns:
             Dict[str, Any]: Validation result with status, details, and a
@@ -119,7 +130,7 @@ class RiskEngine:
             return schema_check_result
 
         # Stage 2: Global Hard Limit Verification
-        limit_check_result = self._global_hard_limit_check(hypothesis)
+        limit_check_result = self._global_hard_limit_check(hypothesis, reduce_only)
         if limit_check_result["status"] == "REJECTED":
             limit_check_result["stage"] = "LIMIT_CHECK"
             return limit_check_result
@@ -147,6 +158,7 @@ class RiskEngine:
                 status=decision_result["status"],
                 original_quantity=hypothesis.quantity,
                 authorization_id=uuid.uuid4().hex,
+                reduce_only=bool(reduce_only),
             )
             token = ValidatedOrder(
                 **fields,
@@ -211,17 +223,29 @@ class RiskEngine:
 
         return {"status": "APPROVED"}
 
-    def _global_hard_limit_check(self, hypothesis: TradeHypothesis) -> Dict[str, Any]:
-        """Global Hard Limit Verification: Check against tamper-evident limits."""
+    def _account_risk(self):
+        tracker = self.equity_tracker or RiskEngine.default_equity_tracker
+        if tracker is None:
+            raise AccountDataUnavailable("no account equity source configured")
+        return tracker.current()
 
-        # Check if account is under drawdown (simulated - always false for now)
-        account_equity = 100000.0  # Simulated
-        account_drawdown = 0.0  # Simulated - would come from exchange
-
-        if account_drawdown > self.limits["max_drawdown_pct"]:
+    def _global_hard_limit_check(self, hypothesis: TradeHypothesis,
+                                 reduce_only: bool = False) -> Dict[str, Any]:
+        """Global Hard Limit Verification: real equity / drawdown (P0-2)."""
+        account = None
+        try:
+            account = self._account_risk()
+        except AccountDataUnavailable as exc:
+            if not reduce_only:      # fail closed for new exposure only
+                return {"status": "REJECTED",
+                        "reason": f"RISK_REJECTED: ACCOUNT_DATA_UNAVAILABLE: {exc}"}
+        if account is not None and not reduce_only \
+                and account.drawdown_pct > self.limits["max_drawdown_pct"]:
             return {
                 "status": "REJECTED",
-                "reason": f"RISK_REJECTED: Account under drawdown circuit breaker ({account_drawdown}% > {self.limits['max_drawdown_pct']}%)"
+                "reason": f"RISK_REJECTED: Account under drawdown circuit breaker "
+                          f"({account.drawdown_pct:.2f}% > {self.limits['max_drawdown_pct']}%, "
+                          f"equity {account.equity} vs peak {account.peak_equity})"
             }
 
         # Check direction violates global limits (simulated)
@@ -235,10 +259,15 @@ class RiskEngine:
                     "reason": f"RISK_REJECTED: Direction limit exceeded: {open_buy_positions} BUY positions already open"
                 }
 
+        if account is None:      # reduce-only with unavailable account data: no equity clamp
+            return {"status": "APPROVED", "max_allowed_position": None,
+                    "account_check": "SKIPPED_REDUCE_ONLY_ACCOUNT_DATA_UNAVAILABLE"}
         return {
             "status": "APPROVED",
-            "available_margin": account_equity * 0.1,  # Simulated
-            "max_allowed_position": account_equity * (self.limits["max_position_size_pct"] / 100.0)
+            "available_margin": account.equity * 0.1,
+            "max_allowed_position": account.equity * (self.limits["max_position_size_pct"] / 100.0),
+            "equity": account.equity, "peak_equity": account.peak_equity,
+            "drawdown_pct": account.drawdown_pct,
         }
 
     def _decision_matrix(self, hypothesis: TradeHypothesis, limit_check_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -264,7 +293,7 @@ class RiskEngine:
         default_price = 50000.0
         position_value = hypothesis.quantity * (hypothesis.price or default_price)
 
-        if position_value > max_allowed_position:
+        if max_allowed_position is not None and position_value > max_allowed_position:
             clamped_quantity = max_allowed_position / (hypothesis.price or default_price)
             return {
                 "status": "CLAMPED",

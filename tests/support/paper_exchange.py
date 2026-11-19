@@ -37,6 +37,8 @@ class PaperExchange:
         self.fill_open_order_on_cancel = False    # race: order fills while being cancelled
         self.has_account_api = True
         self.fail_sends = None                    # exception to raise on every order send
+        self.equity = 100000.0
+        self.equity_mode = "ok"                   # ok | raise | stale | malformed | zero
         self._n = 0
 
     # ---- orders -----------------------------------------------------------------------
@@ -137,6 +139,18 @@ class PaperExchange:
         if self.cancel_conditional_confirms:
             self.conditional_orders = [o for o in self.conditional_orders if o["orderId"] != order_id]
         return {"status": "SUCCESS"}
+
+    def get_account_equity(self):
+        """ASSUMED contract: {"equity": float, "as_of": epoch seconds}. Toobit format unverified."""
+        if self.equity_mode == "raise":
+            raise ConnectionError("equity query failed")
+        if self.equity_mode == "stale":
+            return {"equity": self.equity, "as_of": time.time() - 3600}
+        if self.equity_mode == "malformed":
+            return {"balance": self.equity}
+        if self.equity_mode == "zero":
+            return {"equity": 0, "as_of": time.time()}
+        return {"equity": self.equity, "as_of": time.time()}
 
     # ---- legacy surface used by older tests --------------------------------------------
     def register_sl_tp(self, symbol, side, quantity, price, stop_loss, take_profit):
