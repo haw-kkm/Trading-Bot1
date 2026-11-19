@@ -174,12 +174,31 @@ class Collector:
     gate: DataQualityGate = field(default_factory=DataQualityGate)
     envelopes: List[MarketEnvelope] = field(default_factory=list)
     rejected: List[dict] = field(default_factory=list)
+    # Long-run memory bounds. None = keep everything (fixture replay, tests). For a live run set max_envelopes
+    # (newest N kept in memory) and stream every envelope to `sink` BEFORE it can be evicted, so no evidence is
+    # lost. Totals below are exact regardless of eviction.
+    max_envelopes: Optional[int] = None
+    max_rejected: Optional[int] = None
+    sink: Optional[Callable[[MarketEnvelope], None]] = None
+    envelope_count: int = 0
+    rejected_count: int = 0
     books: Dict[tuple, LocalOrderBook] = field(default_factory=dict)
     network_calls: int = 0           # real network requests made by THIS object (always 0 in FIXTURE)
 
     def reject(self, entry: dict):
         """Quarantine an unparsable message (never used as data)."""
+        self.rejected_count += 1
         self.rejected.append(entry)
+        if self.max_rejected is not None and len(self.rejected) > self.max_rejected:
+            del self.rejected[: len(self.rejected) - self.max_rejected]
+
+    @property
+    def total_envelopes(self) -> int:
+        return max(self.envelope_count, len(self.envelopes))
+
+    @property
+    def total_rejected(self) -> int:
+        return max(self.rejected_count, len(self.rejected))
 
     def _book(self, env: MarketEnvelope) -> LocalOrderBook:
         k = (env.source, env.symbol)
@@ -188,7 +207,12 @@ class Collector:
         return self.books[k]
 
     def _ingest(self, env: MarketEnvelope):
+        self.envelope_count += 1
+        if self.sink is not None:
+            self.sink(env)                      # durable record first; eviction below can then never lose it
         self.envelopes.append(env)
+        if self.max_envelopes is not None and len(self.envelopes) > self.max_envelopes:
+            del self.envelopes[: len(self.envelopes) - self.max_envelopes]
         found = self.gate.observe(env)
         if "DUPLICATE_EVENT" in found or "OUT_OF_ORDER" in found:
             return

@@ -461,7 +461,7 @@ class LiveRunner:
     def health(self, stall_s: float = 20.0) -> Tuple[int, List[str]]:
         """Exit code for a run that ended WITHOUT an exception. A run that produced nothing useful is not success."""
         reasons = []
-        n_ev, n_bad = len(self.c.envelopes), len(self.c.rejected)
+        n_ev, n_bad = self.c.total_envelopes, self.c.total_rejected
         end_gap = ((self.clock() - self.last_msg_at).total_seconds() if self.last_msg_at else 0.0)
         gap = max(self.max_gap_s, end_gap)
         if n_ev == 0:
@@ -630,6 +630,29 @@ def _write(out, col):
     return {"lines": n, "sha256": h.hexdigest()}
 
 
+class JsonlSink:
+    """Streams envelopes to a JSONL file as they arrive (bounded memory) and keeps a running SHA-256 + line count."""
+
+    def __init__(self, path):
+        import hashlib
+        self._fh = open(path, "w", encoding="utf-8", newline="\n")
+        self._h, self.lines = hashlib.sha256(), 0
+
+    def __call__(self, env):
+        line = env.to_json() + "\n"
+        self._fh.write(line)
+        self._h.update(line.encode("utf-8"))
+        self.lines += 1
+
+    def close(self):
+        self._fh.close()
+        return {"lines": self.lines, "sha256": self._h.hexdigest()}
+
+
+# In-memory retention for a live run: the JSONL sink is the evidence, memory only keeps a recent window.
+LIVE_MAX_ENVELOPES, LIVE_MAX_REJECTED = 2_000, 2_000
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Public read-only market data runner (user-run).")
     ap.add_argument("--source", required=True, choices=[s.value for s in Source])
@@ -660,7 +683,8 @@ def main(argv=None) -> int:
         counts = Counter(r["verdict"] for r in rep)
         print(json.dumps({"summary": dict(counts), "endpoints": rep}, indent=2))
         return 1 if counts.get(FAIL) else 0
-    col = Collector()
+    sink = JsonlSink(args.out) if args.out else None
+    col = Collector(max_envelopes=LIVE_MAX_ENVELOPES, max_rejected=LIVE_MAX_REJECTED, sink=sink)
     runner = LiveRunner(col, rest, PublicWsClient(pol))
     code, reasons, err = EXIT_OK, [], None
     try:
@@ -676,12 +700,12 @@ def main(argv=None) -> int:
         code, err = EXIT_INTEGRITY, f"data integrity: {type(e).__name__}: {e}"
     except Exception as e:                                  # internal error: never report as success
         code, err = EXIT_INTEGRITY, f"internal error: {type(e).__name__}"
-    written = _write(args.out, col)
+    written = sink.close() if sink else None
     common = toobit_to_common(args.symbol) if src == Source.TOOBIT_FUTURES else binance_to_common(
         args.symbol, src == Source.BINANCE_FUTURES)
     print(json.dumps({"exit_code": code, "error": err, "unhealthy_reasons": reasons,
-                      "envelopes": len(col.envelopes), "rejected": len(col.rejected),
-                      "issues": dict(Counter(col.gate.kinds())), "reconnects": runner.reconnects,
+                      "envelopes": col.total_envelopes, "rejected": col.total_rejected,
+                      "issues": dict(col.gate.issue_counts), "reconnects": runner.reconnects,
                       "resyncs": runner.resyncs, "rest_retries": runner.rest_retries,
                       "ws_events_by_type": dict(runner.ws_counts), "rest_events_by_type": dict(runner.rest_counts),
                       "rejected_by_error": dict(Counter(r["error"][:120] for r in col.rejected)),
