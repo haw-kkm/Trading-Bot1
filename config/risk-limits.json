@@ -1,0 +1,8 @@
+{
+  "max_leverage": 20.0,
+  "max_position_size_pct": 10.0,
+  "max_drawdown_pct": 15.0,
+  "max_sl_tp_retries": 2,
+  "rollback_timeout_ms": 1000,
+  "max_slippage_pct": 0.005
+}

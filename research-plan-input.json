@@ -1,0 +1,8 @@
+{
+  "ecosystem": "npm",
+  "config": { "exa_search": true, "brave_search": true, "firecrawl": false, "tavily_search": false },
+  "questions": [
+    { "text": "Best practices for multi-agent crypto trading bot architecture targeting Binance and Toobit, focusing on latency, order management safety, and multi-exchange sync.", "kind": "web" },
+    { "text": "Libraries for high-frequency crypto trading in Node.js/TypeScript (latency focused)", "kind": "web" }
+  ]
+}
