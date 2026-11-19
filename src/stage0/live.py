@@ -511,13 +511,9 @@ def _first_keys(raw) -> Optional[set]:
     return None
 
 
-async def check_rest(rest: PublicRestClient, src: Source, symbol: str, now: Callable[[], datetime] = _utcnow) -> List[dict]:
-    """One request per documented public REST endpoint, then PASS / FAIL / INCONCLUSIVE:
-      PASS          response received, required structure present, parser produced events, data non-empty
-      FAIL          request failed (HTTP/transport) or the structure contradicts the parser's expectation
-      INCONCLUSIVE  empty response / no events / docs leave the meaning or unit open (never auto-promoted)
-    Reports shapes and counts only - never response values (apart from the clock offset) and no credentials."""
-    rx = now()
+def _rest_table(src: Source, symbol: str, rx: datetime):
+    """THE single definition of the REST requests of a --check run: (path, params, expected-keys id, parser, verification key).
+    The verifier derives its required-endpoint contract from this same table (required_rest_endpoints)."""
     tb = src == Source.TOOBIT_FUTURES
     if tb:
         T = [("/api/v1/time", None, "toobit:time", None, None),
@@ -543,6 +539,23 @@ async def check_rest(rest: PublicRestClient, src: Source, symbol: str, now: Call
                   ("/fapi/v1/fundingRate", {"symbol": symbol, "limit": 1}, "binance:funding", lambda r: P.parse_funding_history(r, rx), None),
                   ("/futures/data/globalLongShortAccountRatio", {"symbol": symbol, "period": "5m", "limit": 1},
                    "binance:ratio", lambda r: P.parse_long_short_ratio(r, rx), None)]
+    return T
+
+
+def required_rest_endpoints(src: Source) -> List[str]:
+    """Endpoint paths a complete --check run must report exactly once each."""
+    return [row[0] for row in _rest_table(src, "BTC-SWAP-USDT" if src == Source.TOOBIT_FUTURES else "BTCUSDT", _utcnow())]
+
+
+async def check_rest(rest: PublicRestClient, src: Source, symbol: str, now: Callable[[], datetime] = _utcnow) -> List[dict]:
+    """One request per documented public REST endpoint, then PASS / FAIL / INCONCLUSIVE:
+      PASS          response received, required structure present, parser produced events, data non-empty
+      FAIL          request failed (HTTP/transport) or the structure contradicts the parser's expectation
+      INCONCLUSIVE  empty response / no events / docs leave the meaning or unit open (never auto-promoted)
+    Reports shapes and counts only - never response values (apart from the clock offset) and no credentials."""
+    rx = now()
+    tb = src == Source.TOOBIT_FUTURES
+    T = _rest_table(src, symbol, rx)
     out = []
     for path, params, ek, fn, vkey in T:
         row = {"endpoint": path, "verdict": FAIL, "request_ok": False, "http_status": None}

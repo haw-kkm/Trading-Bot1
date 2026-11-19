@@ -223,10 +223,12 @@ def _tool():
 
 def test_tool_all_451_is_fail_for_rest_and_not_run_for_ws():
     t = _tool()
-    rows = [{"endpoint": "/api/v3/time", "verdict": "FAIL", "http_status": 451}] * 3
-    st, why = t.judge_rest({}, rows)
+    from src.stage0.live import required_rest_endpoints
+    req = required_rest_endpoints(Source.BINANCE_SPOT)
+    rows = [{"endpoint": e, "verdict": "FAIL", "http_status": 451} for e in req]
+    st, why = t.judge_rest({"exit_code": 1, "timed_out": False}, rows, req)
     assert st == "FAIL" and "451" in why
-    stages = t.judge_ws({"timed_out": False}, {"exit_code": 3, "error": "required REST data unavailable: HTTP 451"},
+    stages = t.judge_ws({"timed_out": False, "exit_code": 3}, {"exit_code": 3, "error": "required REST data unavailable: HTTP 451"},
                         ("TRADE",), {"invalid_lines": 0}, 20.0)
     assert {v["status"] for v in stages.values()} == {"NOT_RUN"}
     assert t.worst(["PASS", "NOT_RUN", "FAIL"]) == "FAIL" and t.worst(["PASS", "NOT_RUN"]) == "NOT_RUN"
@@ -235,9 +237,10 @@ def test_tool_all_451_is_fail_for_rest_and_not_run_for_ws():
 def test_tool_inconclusive_when_docs_leave_meaning_open_or_data_empty():
     t = _tool()
     rows = [{"endpoint": "/api/v1/time", "verdict": "PASS"}, {"endpoint": "/quote/v1/openInterest", "verdict": "INCONCLUSIVE"}]
-    assert t.judge_rest({}, rows)[0] == "INCONCLUSIVE"
-    assert t.judge_rest({}, [{"endpoint": "/api/v1/time", "verdict": "INCONCLUSIVE"}])[0] in ("FAIL",)      # time must PASS
-    assert t.judge_rest({}, [])[0] == "FAIL"
+    ok, req = {"exit_code": 0, "timed_out": False}, ["/api/v1/time", "/quote/v1/openInterest"]
+    assert t.judge_rest(ok, rows, req)[0] == "INCONCLUSIVE"
+    assert t.judge_rest(ok, [{"endpoint": "/api/v1/time", "verdict": "INCONCLUSIVE"}], ["/api/v1/time"])[0] in ("FAIL",)      # time must PASS
+    assert t.judge_rest(ok, [], req)[0] == "FAIL"
 
 
 def _fresh(*types, gap=1.0):
@@ -245,6 +248,7 @@ def _fresh(*types, gap=1.0):
             "by_type": {t: {"live_count": 3, "first_at": "a", "last_at": "b", "max_gap_s": gap, "end_age_s": 0.5} for t in types}}
 
 
+OK0 = {"timed_out": False, "exit_code": 0}
 GOOD_EVIDENCE = {"status": "PASS", "reason": "reconciled"}      # judge_ws no longer accepts a PASS without verified evidence
 
 
@@ -260,23 +264,23 @@ def test_tool_ws_stages_each_judged_separately():
     t = _tool()
     ev = GOOD_EVIDENCE
     req = ("TRADE", "BOOK_TICKER", "MARK_PRICE")
-    ok = t.judge_ws({"timed_out": False}, good_summary(), req, ev, 20.0)
+    ok = t.judge_ws(OK0, good_summary(), req, ev, 20.0)
     assert {k: v["status"] for k, v in ok.items()} == {"ws_received": "PASS", "ws_parsed": "PASS", "ws_fresh": "PASS", "gate_ready": "PASS",
                                                                   "evidence_integrity": "PASS"}
-    miss = t.judge_ws({"timed_out": False}, good_summary(ws_events_by_type={"TRADE": 1}), req, ev, 20.0)
+    miss = t.judge_ws(OK0, good_summary(ws_events_by_type={"TRADE": 1}), req, ev, 20.0)
     assert miss["ws_received"]["status"] == "FAIL" and set(miss["ws_received"]["missing_types"]) == {"BOOK_TICKER", "MARK_PRICE"}
-    rej = t.judge_ws({"timed_out": False}, good_summary(rejected=31, envelopes=447), req, ev, 20.0)
+    rej = t.judge_ws(OK0, good_summary(rejected=31, envelopes=447), req, ev, 20.0)
     assert rej["ws_parsed"]["status"] == "FAIL"
-    few = t.judge_ws({"timed_out": False}, good_summary(rejected=1, envelopes=447), req, ev, 20.0)
+    few = t.judge_ws(OK0, good_summary(rejected=1, envelopes=447), req, ev, 20.0)
     assert few["ws_parsed"]["status"] == "INCONCLUSIVE"
-    stall = t.judge_ws({"timed_out": False}, good_summary(max_gap_s=45.0), req, ev, 20.0)
+    stall = t.judge_ws(OK0, good_summary(max_gap_s=45.0), req, ev, 20.0)
     assert stall["ws_fresh"]["status"] == "FAIL"
-    unv = t.judge_ws({"timed_out": False}, good_summary(end_of_collection={"readiness": "UNVERIFIED", "core_types": [], "per_type": {}}), req, ev, 20.0)
+    unv = t.judge_ws(OK0, good_summary(end_of_collection={"readiness": "UNVERIFIED", "core_types": [], "per_type": {}}), req, ev, 20.0)
     assert unv["gate_ready"]["status"] == "INCONCLUSIVE"
-    notready = t.judge_ws({"timed_out": False}, good_summary(end_of_collection={"readiness": "STALE", "core_types": [], "per_type": {}}), req, ev, 20.0)
+    notready = t.judge_ws(OK0, good_summary(end_of_collection={"readiness": "STALE", "core_types": [], "per_type": {}}), req, ev, 20.0)
     assert notready["gate_ready"]["status"] == "FAIL"
     assert t.judge_ws({"timed_out": True}, None, req, ev, 20.0)["ws_received"]["status"] == "FAIL"
-    assert t.judge_ws({"timed_out": False}, None, req, ev, 20.0)["gate_ready"]["status"] == "FAIL"
+    assert t.judge_ws(OK0, None, req, ev, 20.0)["gate_ready"]["status"] == "FAIL"
 
 
 def test_tool_main_exit_codes_and_report(tmp_path, monkeypatch):

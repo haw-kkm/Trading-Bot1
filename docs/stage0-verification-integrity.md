@@ -23,3 +23,13 @@ CI: `collect-evidence` uploads evidence and always writes the per-market table; 
 | openInterest `size` | "Total open interest of the platform Specific coins, eg.: ETH in ETHUSDT"; example symbol is ETH-SWAP-USDT (wording and symbol disagree); no unit; no link to `contractMultiplier` | none compared against contract spec | stays UNVERIFIED |
 | index vs BTC-SWAP-USDT | endpoint keyed by BTCUSDT; exchangeInfo contracts carry `"index": "BTCUSDT"`, which suggests the mapping but does not state it | price similarity is not evidence | stays UNVERIFIED (check exchangeInfo `index` field equals the queried name) |
 | diffDepth | page covers REST only; WS sequence semantics not documented here (adapter notes: versions not guaranteed unique) | - | UNVERIFIED; no full order-book reconstruction is claimed |
+
+## Verification chain (second hardening pass)
+`collector process -> collector summary -> JSONL evidence -> verifier -> Actions gate`; a missing or contradictory link blocks PASS.
+* REST: `judge_rest(check, rows, required)` needs the check subprocess to finish (no timeout, exit 0, or 1 only when a row FAILs),
+  every required endpoint exactly once (contract = `live.required_rest_endpoints`, derived from the same table `check_rest`
+  executes), unknown endpoints never substitute. `environment_blocked` additionally requires a complete 451-only report.
+* Evidence PASS needs: file, valid envelopes, summary count, per-type counts, collector-attested line count AND SHA-256, both
+  equal to the file. Missing attestation -> INCONCLUSIVE; any mismatch/corruption -> FAIL. The file is scanned as a stream
+  (one line at a time, 16 MiB per-line cap, incremental SHA-256).
+* Collector subprocess exit code must equal the summary `exit_code`; otherwise every WS stage is FAIL.

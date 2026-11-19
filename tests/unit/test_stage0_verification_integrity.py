@@ -104,7 +104,7 @@ def judge(r, evidence=None, required=REQ, **summary_kw):
          "rest_events_by_type": dict(r.rest_counts), "end_of_collection": r.end_state,
          "stream_freshness": r.stream_report()}
     s.update(summary_kw)
-    return t.judge_ws({"timed_out": False}, s, required, evidence or {"status": "PASS", "reason": "x"}, 20.0)
+    return t.judge_ws({"timed_out": False, "exit_code": s["exit_code"]}, s, required, evidence or {"status": "PASS", "reason": "x"}, 20.0)
 
 
 # ===================================================================== per-stream freshness
@@ -206,6 +206,12 @@ def _lines(n, etype_flow=("BOOK_TICKER",)):
     return out
 
 
+def _att(path):
+    import hashlib
+    b = pathlib.Path(path).read_bytes()
+    return {"lines": b.count(b"\x0a"), "sha256": hashlib.sha256(b).hexdigest()}
+
+
 def _summary(n, **kw):
     s = {"exit_code": 0, "envelopes": n, "rejected": 0, "ws_events_by_type": {"BOOK_TICKER": n}, "rest_events_by_type": {}}
     s.update(kw)
@@ -216,7 +222,7 @@ def test_missing_event_file_with_events_in_summary_is_never_pass(tmp_path):
     t = _tool()
     ev = t.evidence_integrity(tmp_path / "nope.jsonl", _summary(10))
     assert ev["status"] == "INCONCLUSIVE" and ev["kind"] == "missing" and ev["file_present"] is False
-    st = t.judge_ws({"timed_out": False}, dict(_summary(10), max_gap_s=1.0), ("BOOK_TICKER",), ev, 20.0)
+    st = t.judge_ws({"timed_out": False, "exit_code": 0}, dict(_summary(10), max_gap_s=1.0), ("BOOK_TICKER",), ev, 20.0)
     assert st["ws_parsed"]["status"] != "PASS" and st["evidence_integrity"]["status"] != "PASS"
 
 
@@ -227,7 +233,7 @@ def test_truncated_event_file_is_fail(tmp_path):
     f.write_text(body[: -40], encoding="utf-8")                   # cut in the middle of the last line
     ev = t.evidence_integrity(f, _summary(5))
     assert ev["status"] == "FAIL" and ev["kind"] == "truncated"
-    st = t.judge_ws({"timed_out": False}, dict(_summary(5), max_gap_s=1.0), ("BOOK_TICKER",), ev, 20.0)
+    st = t.judge_ws({"timed_out": False, "exit_code": 0}, dict(_summary(5), max_gap_s=1.0), ("BOOK_TICKER",), ev, 20.0)
     assert st["ws_parsed"]["status"] == "FAIL"
 
 
@@ -294,7 +300,7 @@ def test_runtime_fatal_error_is_not_hidden_by_a_clean_log(tmp_path):
     f.write_text("\n".join(_lines(4)) + "\n", encoding="utf-8")
     ev = t.evidence_integrity(f, _summary(4))
     s = dict(_summary(4, exit_code=5, error="data integrity: FatalDataError: Invalid Symbols!"), max_gap_s=1.0)
-    st = t.judge_ws({"timed_out": False}, s, ("BOOK_TICKER",), ev, 20.0)
+    st = t.judge_ws({"timed_out": False, "exit_code": 5}, s, ("BOOK_TICKER",), ev, 20.0)
     assert st["runtime"]["status"] == "FAIL" and st["ws_received"]["status"] == "FAIL"   # exit 5 stays a failure
     assert t.worst([v["status"] for v in st.values()]) == "FAIL"
 
@@ -335,12 +341,13 @@ def _fake_runs(t, monkeypatch, rest_rows, collect_summary=None):
             out.write_text(json.dumps({"endpoints": rest_rows}), encoding="utf-8")
         else:
             out.write_text(json.dumps(collect_summary), encoding="utf-8")
-        return {"command": name, "exit_code": 0, "timed_out": False, "stdout_file": out.name, "stderr_file": err.name}
+        code = (1 if any(r.get("verdict") == "FAIL" for r in rest_rows) else 0) if name.endswith("rest_check") else collect_summary["exit_code"]
+        return {"command": name, "exit_code": code, "timed_out": False, "stdout_file": out.name, "stderr_file": err.name}
     monkeypatch.setattr(t, "run_command", fake_run)
 
 
-R451 = [{"endpoint": "/api/v3/time", "verdict": "FAIL", "http_status": 451},
-        {"endpoint": "/api/v3/depth", "verdict": "FAIL", "http_status": 451}]
+SPOT_REQ = live.required_rest_endpoints(Source.BINANCE_SPOT)
+R451 = [{"endpoint": e, "verdict": "FAIL", "http_status": 451} for e in SPOT_REQ]
 S3 = {"exit_code": 3, "error": "required REST startup data unavailable: HTTP 451", "envelopes": 0, "rejected": 0}
 
 
@@ -355,7 +362,7 @@ def test_binance_451_rest_fail_ws_not_run_blocked_and_exit_2(tmp_path, monkeypat
 
 def test_451_mixed_with_a_real_failure_is_not_excused(tmp_path, monkeypatch):
     t = _tool()
-    _fake_runs(t, monkeypatch, R451 + [{"endpoint": "/api/v3/ticker/price", "verdict": "FAIL", "http_status": 500}], S3)
+    _fake_runs(t, monkeypatch, R451[:-1] + [{"endpoint": SPOT_REQ[-1], "verdict": "FAIL", "http_status": 500}], S3)
     rec = t.verify("binance-spot", tmp_path, 30, 10)
     assert rec["environment_blocked"] is False
     assert t.exit_code([rec], "FAIL") == 1
@@ -372,7 +379,7 @@ def test_main_writes_markdown_table_and_never_reports_fail_as_success(tmp_path, 
     t = _tool()
     _fake_runs(t, monkeypatch, R451, S3)
     summary = tmp_path / "step_summary.md"
-    code = t.main(["--output-dir", str(tmp_path / "ev"), "--binance-only", "--summary-file", str(summary)])
+    code = t.main(["--output-dir", str(tmp_path / "ev"), "--sources", "binance-spot", "--summary-file", str(summary)])
     assert code == 2
     md = summary.read_text(encoding="utf-8")
     assert "| binance-spot |" in md and "environment_blocked: HTTP 451" in md and "Not verified" in md

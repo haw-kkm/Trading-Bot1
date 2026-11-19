@@ -32,6 +32,12 @@ from pathlib import Path
 import subprocess
 import sys
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from src.stage0.envelope import Source  # noqa: E402  (after sys.path setup)
+from src.stage0.live import required_rest_endpoints  # noqa: E402  single source of truth: check_rest's request table
+
 PASS, FAIL, INCONCLUSIVE, NOT_RUN = "PASS", "FAIL", "INCONCLUSIVE", "NOT_RUN"
 _ORDER = {FAIL: 3, NOT_RUN: 2, INCONCLUSIVE: 1, PASS: 0}
 
@@ -73,56 +79,85 @@ ENVELOPE_KEYS = {"source", "symbol", "event_type", "event_time", "received_at", 
                  "raw_payload", "normalized_payload", "digest"}
 
 
+MAX_LINE_BYTES = 16 * 1024 * 1024      # one envelope line larger than this is treated as corrupt (bounded memory)
+
+
+def _scan_jsonl(path: Path):
+    """Single streaming pass (constant memory): SHA-256, line count, valid-envelope counts by type, bad lines,
+    and whether the last line is missing its newline. Never holds more than one line (<= MAX_LINE_BYTES)."""
+    h, lines, bad, oversize, types, unterminated = hashlib.sha256(), 0, 0, 0, Counter(), False
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.readline(MAX_LINE_BYTES + 1)
+            if not chunk:
+                break
+            h.update(chunk)
+            lines += 1
+            unterminated = not chunk.endswith(b"\n")
+            if len(chunk) > MAX_LINE_BYTES and unterminated:        # oversized line: drain it without keeping it
+                oversize += 1
+                bad += 1
+                while True:
+                    more = fh.readline(1 << 20)
+                    if not more:
+                        break
+                    h.update(more)
+                    unterminated = not more.endswith(b"\n")
+                    if not unterminated:
+                        break
+                continue
+            if unterminated:
+                continue                                            # truncated last line, reported separately
+            try:
+                obj = json.loads(chunk.decode("utf-8"))
+                if not isinstance(obj, dict) or not ENVELOPE_KEYS <= set(obj) or not isinstance(obj["event_type"], str):
+                    raise ValueError("not an envelope")
+                types[obj["event_type"]] += 1
+            except (ValueError, UnicodeDecodeError):
+                bad += 1
+    return {"sha256": h.hexdigest(), "lines": lines, "bad": bad, "oversize": oversize, "types": types,
+            "truncated": unterminated}
+
+
 def evidence_integrity(jsonl: Path, summary):
-    """Reconcile the events JSONL with the collector summary. Distinguishes MISSING (cannot judge ->
-    INCONCLUSIVE) from CORRUPT / TRUNCATED / COUNT MISMATCH (FAIL). Never PASS without real event evidence."""
+    """Reconcile the events JSONL (streamed) with the collector summary. PASS needs ALL of: file present, every
+    line a valid envelope, summary count == recorded count, per-type counts match (ws+rest), the collector's
+    attestation (lines AND sha256) present and equal to what is on disk. MISSING evidence -> INCONCLUSIVE;
+    CORRUPT / TRUNCATED / any mismatch -> FAIL."""
     s = summary if isinstance(summary, dict) else {}
     summary_count = s.get("envelopes") if isinstance(s.get("envelopes"), int) else None
     out = {"status": FAIL, "kind": None, "file_present": False, "summary_count": summary_count, "lines": 0,
            "recorded_count": 0, "invalid_lines": 0, "counts_match": False, "types": {}, "sha256": None,
-           "sha256_attested": False, "sha256_matches_attestation": None, "reason": ""}
+           "sha256_attested": False, "sha256_matches_attestation": None, "attested_lines": None, "reason": ""}
     if not jsonl.is_file():
         out.update(status=INCONCLUSIVE, kind="missing", reason="events file is missing: parsing cannot be proven")
         return out
-    raw = jsonl.read_bytes()
-    out.update(file_present=True, sha256=hashlib.sha256(raw).hexdigest())
-    parts = raw.split(b"\n")
-    truncated = bool(parts[-1])            # last line lacks its newline: the writer always ends lines with LF
-    lines = parts if truncated else parts[:-1]
-    types, bad = Counter(), 0
-    for i, ln in enumerate(lines):
-        if truncated and i == len(lines) - 1:
-            continue                       # reported as truncation below
-        try:
-            obj = json.loads(ln.decode("utf-8"))
-            if not isinstance(obj, dict) or not ENVELOPE_KEYS <= set(obj) or not isinstance(obj["event_type"], str):
-                raise ValueError("not an envelope")
-            types[obj["event_type"]] += 1
-        except (ValueError, UnicodeDecodeError):
-            bad += 1
-    recorded = sum(types.values())
-    out.update(lines=len(lines), invalid_lines=bad + (1 if truncated else 0), recorded_count=recorded,
-               types=dict(sorted(types.items())))
+    sc = _scan_jsonl(jsonl)
+    types, recorded = sc["types"], sum(sc["types"].values())
+    out.update(file_present=True, sha256=sc["sha256"], lines=sc["lines"], recorded_count=recorded,
+               invalid_lines=sc["bad"] + (1 if sc["truncated"] else 0), types=dict(sorted(types.items())))
     att = s.get("events_file_written")
-    if isinstance(att, dict) and att.get("sha256"):
-        out.update(sha256_attested=True, sha256_matches_attestation=att["sha256"] == out["sha256"])
-    problems = []
-    if truncated:
+    att = att if isinstance(att, dict) else {}
+    att_sha = att.get("sha256") if isinstance(att.get("sha256"), str) and att.get("sha256") else None
+    att_lines = att.get("lines") if isinstance(att.get("lines"), int) and not isinstance(att.get("lines"), bool) else None
+    out.update(sha256_attested=att_sha is not None, attested_lines=att_lines,
+               sha256_matches_attestation=None if att_sha is None else att_sha == sc["sha256"])
+    problems, missing = [], []
+    if sc["truncated"]:
         out["kind"] = "truncated"
         problems.append("last line is cut off (no terminating newline)")
-    if bad:
-        out["kind"] = out["kind"] or "corrupt"
-        problems.append(f"{bad} line(s) are not valid envelopes")
+    if sc["bad"]:
+        out["kind"] = out["kind"] or ("oversized_line" if sc["oversize"] else "corrupt")
+        problems.append(f"{sc['bad']} line(s) are not valid envelopes" + (f" ({sc['oversize']} oversized)" if sc["oversize"] else ""))
     if summary_count is None:
-        out["kind"] = out["kind"] or "no_summary_count"
-        out["status"] = FAIL if problems else INCONCLUSIVE
-        out["reason"] = "; ".join(problems) or "collector summary has no event count to reconcile"
-        return out
-    if recorded != summary_count:
+        missing.append("collector summary has no event count to reconcile")
+    elif recorded != summary_count:
         out["kind"] = out["kind"] or "count_mismatch"
         problems.append(f"summary says {summary_count} events, file holds {recorded}")
     ws_c, rest_c = s.get("ws_events_by_type"), s.get("rest_events_by_type")
-    if ws_c is not None or rest_c is not None:
+    if ws_c is None and rest_c is None:
+        missing.append("collector summary has no per-type counts")
+    else:
         expected = Counter(ws_c or {}) + Counter(rest_c or {})
         if expected != types:
             diff = {t: [expected.get(t, 0), types.get(t, 0)] for t in sorted(set(expected) | set(types))
@@ -130,34 +165,76 @@ def evidence_integrity(jsonl: Path, summary):
             out["kind"] = out["kind"] or "type_count_mismatch"
             out["type_count_diff"] = diff
             problems.append(f"per-type counts differ (summary vs file, [expected, recorded]): {diff}")
-    if out["sha256_matches_attestation"] is False:
+    if att_lines is None:
+        missing.append("collector did not record the number of lines it wrote")
+    elif att_lines != sc["lines"]:
+        out["kind"] = out["kind"] or "attested_lines_mismatch"
+        problems.append(f"collector wrote {att_lines} lines, file has {sc['lines']}")
+    if att_sha is None:
+        missing.append("collector did not record a SHA-256 of the file it wrote")
+    elif att_sha != sc["sha256"]:
         out["kind"] = out["kind"] or "sha256_mismatch"
         problems.append("file SHA-256 differs from the hash the collector recorded when writing it")
-    out["counts_match"] = recorded == summary_count and not problems
-    if problems:
-        out.update(status=FAIL, reason="; ".join(problems))
+    out["counts_match"] = summary_count is not None and recorded == summary_count and not problems
+    if problems:                                   # real damage / contradiction beats merely absent evidence
+        out.update(status=FAIL, reason="; ".join(problems + missing))
         return out
-    out.update(status=PASS, reason=f"{recorded} events reconcile with the summary (count, per-type"
-               + (", SHA-256 attested)" if out["sha256_attested"] else "; no SHA-256 attestation in summary)"))
+    if missing:
+        out.update(status=INCONCLUSIVE, kind="attestation_missing" if att_sha is None or att_lines is None else "summary_incomplete",
+                   reason="evidence cannot be fully verified: " + "; ".join(missing))
+        return out
+    out.update(status=PASS, reason=f"{recorded} events reconcile with the summary (count, per-type, collector-attested "
+                                   f"line count and SHA-256 match the file)")
     return out
 
 
-def judge_rest(check, rows):
-    """-> (status, reason)"""
-    rows = [r for r in rows if isinstance(r, dict)]
-    if not rows:
+def rest_contract(rows, required):
+    """Compare the reported REST rows with the endpoint contract. Unknown endpoints never count toward it."""
+    names = [r.get("endpoint") for r in rows if isinstance(r, dict)]
+    c = Counter(names)
+    req = list(required or [])
+    return {"required": req, "missing": [e for e in req if c[e] == 0], "duplicated": sorted(e for e in req if c[e] > 1),
+            "unknown": sorted(str(e) for e in c if e not in req), "malformed": len(rows) - len(names)}
+
+
+def judge_rest(check, rows, required=None):
+    """-> (status, reason). Fail-closed: the check run itself must have completed, and EXACTLY the required
+    endpoints must each be reported once. `required=None` means the contract is unknown -> never PASS."""
+    check = check if isinstance(check, dict) else {}
+    if check.get("timed_out"):
+        return (FAIL, "REST check subprocess timed out: the check is incomplete")
+    code = check.get("exit_code")
+    if code not in (0, 1):
+        return (FAIL, f"REST check subprocess exit code {code!r} (expected 0, or 1 when an endpoint FAILed): crashed, refused or not run")
+    if not isinstance(rows, list) or not rows:
         return (FAIL, "--check produced no endpoint rows (crash or timeout)")
+    if any(not isinstance(r, dict) for r in rows):
+        return (FAIL, "--check output contains malformed endpoint rows")
+    any_fail = any(r.get("verdict") == "FAIL" for r in rows)
+    if (code == 1) != any_fail:
+        return (FAIL, f"REST check exit code {code} contradicts its endpoint verdicts "
+                      f"({'FAIL rows present' if any_fail else 'no FAIL row'})")
+    if required is None:
+        return (INCONCLUSIVE, "no endpoint contract supplied: completeness of the REST check cannot be established")
+    ct = rest_contract(rows, required)
+    if ct["duplicated"]:
+        return (FAIL, f"required endpoint(s) reported more than once: {ct['duplicated']}")
+    if ct["missing"]:
+        return (FAIL, f"required endpoint(s) never reported (check incomplete): {ct['missing']}")
+    rows = [r for r in rows if r.get("endpoint") in set(required)]          # unknown endpoints cannot stand in for them
     v = Counter(r.get("verdict") for r in rows)
     statuses = Counter(r.get("http_status") for r in rows)
     if v["FAIL"]:
         if statuses[451] == len(rows):
             return (FAIL, "every request returned HTTP 451 (access restricted by region/legal; not bypassed)")
         return (FAIL, f"{v['FAIL']} of {len(rows)} endpoints FAIL")
-    if not any(r.get("verdict") == "PASS" and r.get("endpoint", "").endswith("/time") for r in rows):
+    if any(r.get("verdict") not in (PASS, INCONCLUSIVE) for r in rows):
+        return (FAIL, "an endpoint has no valid verdict")
+    if not any(r.get("verdict") == PASS and r.get("endpoint", "").endswith("/time") for r in rows):
         return (FAIL, "server-time endpoint did not PASS")
     if v["INCONCLUSIVE"]:
         return (INCONCLUSIVE, f"{v['INCONCLUSIVE']} endpoint(s) INCONCLUSIVE (empty / meaning unverified)")
-    return (PASS, "all endpoints PASS")
+    return (PASS, f"all {len(required)} required endpoints reported once and PASS")
 
 
 DEFAULT_STREAM_LIMIT_S = 20.0
@@ -208,6 +285,13 @@ def judge_ws(collect, summary, required, evidence, stall_s, limits=None):
             stages[k] = {"status": FAIL, "reason": "no valid collection summary (crash)"}
         return stages
     code = summary["exit_code"]
+    proc = collect.get("exit_code")
+    if proc != code:                         # the process and its own summary disagree: nothing here is trustworthy
+        why = f"collection subprocess exit code {proc!r} contradicts summary exit_code {code!r}"
+        for k in names:
+            stages[k] = {"status": FAIL, "reason": why}
+        stages["runtime"] = {"status": FAIL, "exit_code": proc, "reason": why}
+        return stages
     if code in (2, 3):
         why = {2: "network permission refused", 3: "required REST startup data unavailable (e.g. HTTP 451); "
                                                    "streaming was never started"}[code]
@@ -279,17 +363,22 @@ def verify(source: str, logdir: Path, seconds: int, timeout: int):
     check = run_command(prefix + ".rest_check", base + ["--check"], logdir, timeout)
     check_result = read_json_stdout(logdir / check["stdout_file"])
     rows = check_result.get("endpoints", []) if isinstance(check_result, dict) else []
-    rest_status, rest_reason = judge_rest(check, rows)
+    required_rest = required_rest_endpoints(Source(source))
+    rest_status, rest_reason = judge_rest(check, rows, required_rest)
     output = logdir / (prefix + ".events.jsonl")
     collect = run_command(prefix + ".websocket_collect", base + ["--seconds", str(seconds), "--out", str(output)],
                           logdir, timeout)
     summary = read_json_stdout(logdir / collect["stdout_file"])
     evidence = evidence_integrity(output, summary)
-    stages = {"rest": {"status": rest_status, "reason": rest_reason, "endpoints": rows}}
+    stages = {"rest": {"status": rest_status, "reason": rest_reason, "endpoints": rows,
+                       "contract": rest_contract(rows, required_rest)}}
     stages.update(judge_ws(collect, summary, required, evidence, 20.0))
     # Environment-blocked ONLY if every REST request was HTTP 451 AND streaming was therefore never run
     # (every non-REST stage NOT_RUN). Any other failure next to a 451 is a real failure and is not excused.
-    all_451 = bool(rows) and all(isinstance(r, dict) and r.get("http_status") == 451 for r in rows)
+    ct = stages["rest"]["contract"]
+    all_451 = (bool(rows) and all(isinstance(r, dict) and r.get("http_status") == 451 for r in rows)
+               and not (ct["missing"] or ct["duplicated"] or ct["malformed"]) and rest_status == FAIL
+               and check.get("exit_code") == 1 and not check.get("timed_out"))
     blocked = all_451 and all(v["status"] == NOT_RUN for k, v in stages.items() if k != "rest")
     return {"source": source, "symbol": symbol, "environment_blocked": blocked,
             "blocked_reason": "all REST requests returned HTTP 451 (restricted region/legal; not bypassed)" if blocked else None,
