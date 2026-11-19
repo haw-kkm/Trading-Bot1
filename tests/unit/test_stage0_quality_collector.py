@@ -117,6 +117,9 @@ def test_disconnect_then_reconnect_is_syncing_until_synced():
     g.on_connect(Source.BINANCE_SPOT, ["BTC/USDT"])
     assert g.status(Source.BINANCE_SPOT, "BTC/USDT", T0) == Readiness.SYNCING
     g.mark_synced(Source.BINANCE_SPOT, "BTC/USDT")
+    # synced, but the data seen BEFORE the disconnect must not count: needs fresh data first
+    assert g.status(Source.BINANCE_SPOT, "BTC/USDT", T0) == Readiness.STALE
+    g.observe(trade(2, MS + 1000))
     assert g.usable(Source.BINANCE_SPOT, "BTC/USDT", T0)
 
 
@@ -198,7 +201,7 @@ def test_divergence_flags_large_gap_between_comparable_feeds():
     g.observe(a)
     g.observe(b)
     g._prices[("binance-futures", sym, "last")] = b      # same common key to compare (test wiring)
-    g._last_rx[("binance-futures", sym)] = T0
+    g._type_rx[("binance-futures", sym, "TRADE")] = T0
     d = g.divergence(Source.BINANCE_SPOT, Source.BINANCE_FUTURES, sym, "last", T0, allow_basis=True)
     assert d.exceeds and d.pct > Decimal("1.9") and "PRICE_DIVERGENCE" in g.kinds()
 
@@ -213,7 +216,7 @@ def test_divergence_refuses_stale_or_skewed_inputs():
                               T0 + timedelta(seconds=5))[0]
     g.observe(a); g.observe(b)
     g._prices[("binance-futures", sym, "last")] = b
-    g._last_rx[("binance-futures", sym)] = T0 + timedelta(seconds=5)
+    g._type_rx[("binance-futures", sym, "TRADE")] = T0 + timedelta(seconds=5)
     r = g.divergence(Source.BINANCE_SPOT, Source.BINANCE_FUTURES, sym, "last", T0 + timedelta(seconds=5), allow_basis=True)
     assert isinstance(r, str) and "NOT_COMPARABLE" in r      # spot feed is 5s old -> stale/skewed
     r2 = g.divergence(Source.BINANCE_SPOT, Source.BINANCE_FUTURES, sym, "mark", T0, allow_basis=True)

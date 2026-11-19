@@ -43,7 +43,22 @@ class Divergence:
     exceeds: bool
 
 
+# Types that arrive as a continuous stream: their freshness is dropped on disconnect (data from a dead
+# connection must not count) and they are the only ones subject to the receive-lag check.
+STREAMING_TYPES = frozenset({"TRADE", "TICKER", "BOOK_TICKER", "ORDERBOOK_SNAPSHOT", "ORDERBOOK_DELTA",
+                             "MARK_PRICE", "INDEX_PRICE", "KLINE", "LIQUIDATION"})
+LAG_CHECKED_TYPES = frozenset({"TRADE", "TICKER", "BOOK_TICKER", "ORDERBOOK_SNAPSHOT", "ORDERBOOK_DELTA",
+                               "MARK_PRICE", "KLINE"})
+# Polled (slow) reference types may legitimately be older than a streaming tick.
+SLOW_MAX_AGE = {"OPEN_INTEREST": timedelta(seconds=180), "LONG_SHORT_RATIO": timedelta(seconds=900),
+                "FUNDING_RATE": timedelta(hours=2), "CONTRACT_SPEC": timedelta(days=2),
+                "SERVER_TIME": timedelta(minutes=10)}
+
+
 class DataQualityGate:
+    """Freshness is tracked PER (source, symbol, event type). A consumer states which types it needs;
+    READY requires every one of them to be present, fresh, timestamp-sane and verified."""
+
     def __init__(self, max_age: timedelta = timedelta(seconds=10),
                  max_receive_lag: timedelta = timedelta(seconds=5),
                  max_pair_skew: timedelta = timedelta(seconds=2),
@@ -53,7 +68,10 @@ class DataQualityGate:
         self.issues: List[Issue] = []
         self._last: Dict[Tuple, MarketEnvelope] = {}        # (source,symbol,type) -> last accepted
         self._seen_seq: Dict[Tuple, set] = {}
-        self._last_rx: Dict[Tuple, datetime] = {}           # (source,symbol) -> last received_at
+        self._type_rx: Dict[Tuple, datetime] = {}           # (source,symbol,type) -> last GOOD received_at
+        self._seen_types: Dict[Tuple, set] = {}             # (source,symbol) -> types ever seen
+        self._bad_ts: Dict[Tuple, str] = {}                 # (source,symbol,type) -> reason (future / lag)
+        self.max_age_by_type: Dict[str, timedelta] = dict(SLOW_MAX_AGE)
         self._conn: Dict[str, bool] = {}
         self._syncing: set = set()
         self._invalid: Dict[Tuple, str] = {}
@@ -71,6 +89,11 @@ class DataQualityGate:
     def on_disconnect(self, source: Source):
         self._conn[source.value] = False
         self._issue("DISCONNECTED", source)
+        # data received on the dead connection must not keep the symbol READY after a reconnect:
+        for k in [k for k in self._type_rx if k[0] == source.value and k[2] in STREAMING_TYPES]:
+            del self._type_rx[k]
+        for k in [k for k in self._bad_ts if k[0] == source.value]:
+            del self._bad_ts[k]
 
     def on_connect(self, source: Source, symbols=()):
         """A (re)connection starts a re-sync: symbols stay SYNCING until mark_synced()."""
@@ -84,6 +107,12 @@ class DataQualityGate:
         self.clock_offsets[source.value] = offset_ms
         if abs(offset_ms) > max_ms:
             self._issue("CLOCK_SKEW", source, "", f"{offset_ms} ms")
+
+    def on_reference_failed(self, source: Source, symbol: str, event_type: str, detail: str = ""):
+        """An optional reference datum could not be obtained. The type becomes a REQUIRED-but-missing type for
+        any consumer of this symbol (status() -> STALE) until a real event of that type arrives."""
+        self._seen_types.setdefault((source.value, symbol), set()).add(event_type)
+        self._issue("REFERENCE_UNAVAILABLE", source, symbol, f"{event_type}: {detail}")
 
     def mark_synced(self, source: Source, symbol: str):
         self._syncing.discard((source.value, symbol))
@@ -110,6 +139,7 @@ class DataQualityGate:
         """Record one event. Returns the issue kinds found (event may still be informational)."""
         found: List[str] = []
         src, sym = env.source.value, env.symbol
+        self._seen_types.setdefault((src, sym), set()).add(env.event_type.value)
         if "UNVERIFIED_SCHEMA" in env.quality_flags:
             self._unverified.add((src, sym, env.event_type.value))
         key = (src, sym, env.event_type.value)
@@ -120,8 +150,15 @@ class DataQualityGate:
 
         if "FUTURE_EVENT_TIME" in env.quality_flags:
             flag("FUTURE_EVENT_TIME", str(env.event_time))
-        if env.event_time and env.received_at - env.event_time > self.max_receive_lag:
+        lag = (env.event_type.value in LAG_CHECKED_TYPES and env.event_time is not None
+               and env.received_at - env.event_time > self.max_receive_lag)
+        if lag:
             flag("RECEIVE_LAG", str(env.received_at - env.event_time))
+        if "FUTURE_EVENT_TIME" in env.quality_flags or lag:
+            # an event with an insane timestamp is NOT evidence of fresh data: it does not refresh the
+            # type, and the type stays INVALID until a sane event of the same type arrives.
+            self._bad_ts[key] = "future event time" if "FUTURE_EVENT_TIME" in env.quality_flags else "receive lag"
+            return found
         if env.sequence_id is not None and env.event_type != EventType.ORDERBOOK_SNAPSHOT:
             seen = self._seen_seq.setdefault(key, set())
             if env.sequence_id in seen:
@@ -149,7 +186,8 @@ class DataQualityGate:
                 self._invalid[(src, sym)] = "crossed snapshot"
                 return found
         self._last[key] = env
-        self._last_rx[(src, sym)] = env.received_at
+        self._type_rx[key] = env.received_at
+        self._bad_ts.pop(key, None)
         if (src, sym) in self._invalid and self._invalid[(src, sym)] == "crossed book ticker":
             if env.event_type == EventType.BOOK_TICKER:
                 self._invalid.pop((src, sym))     # a sane quote clears the quote-level fault
@@ -174,10 +212,39 @@ class DataQualityGate:
             return Readiness.SYNCING
         if (src, symbol) in self._invalid:
             return Readiness.INVALID
-        last = self._last_rx.get((src, symbol))
-        if last is None or now - last > self.max_age:
-            return Readiness.STALE
+        need = sorted(wanted) if wanted is not None else sorted(self._seen_types.get((src, symbol), ()))
+        if not need:
+            return Readiness.STALE                      # nothing ever received for this symbol
+        for t in need:
+            k = (src, symbol, t)
+            if k in self._bad_ts:
+                return Readiness.INVALID
+            rx = self._type_rx.get(k)
+            if rx is None:
+                return Readiness.STALE                  # required type missing (never seen / dropped by disconnect)
+            if now - rx > self.max_age_by_type.get(t, self.max_age):
+                return Readiness.STALE
         return Readiness.READY
+
+    def explain(self, source: Source, symbol: str, now: datetime, types=None) -> Dict[str, str]:
+        """Per-type diagnosis (MISSING / STALE / BAD_TIMESTAMP / UNVERIFIED / OK) for logs and reports."""
+        src = source.value
+        need = sorted({getattr(t, "value", t) for t in types}) if types is not None else             sorted(self._seen_types.get((src, symbol), ()))
+        out = {}
+        for t in need:
+            k = (src, symbol, t)
+            rx = self._type_rx.get(k)
+            if k in self._unverified:
+                out[t] = "UNVERIFIED"
+            elif k in self._bad_ts:
+                out[t] = "BAD_TIMESTAMP: " + self._bad_ts[k]
+            elif rx is None:
+                out[t] = "MISSING"
+            elif now - rx > self.max_age_by_type.get(t, self.max_age):
+                out[t] = f"STALE ({(now - rx).total_seconds():.1f}s)"
+            else:
+                out[t] = "OK"
+        return out
 
     def usable(self, source: Source, symbol: str, now: datetime, types=None) -> bool:
         """The ONLY question downstream may ask. False unless READY."""
@@ -191,13 +258,13 @@ class DataQualityGate:
         Both sources must be READY and their event times close (max_pair_skew)."""
         if (a == Source.BINANCE_SPOT) != (b == Source.BINANCE_SPOT) and not allow_basis:
             return "BASIS_NOT_COMPARABLE: spot vs futures requires explicit basis handling"
-        for s in (a, b):
-            st = self.status(s, symbol, now)
-            if st != Readiness.READY:
-                return f"NOT_COMPARABLE: {s.value} is {st.value}"
         ea, eb = self._prices.get((a.value, symbol, kind)), self._prices.get((b.value, symbol, kind))
         if ea is None or eb is None:
             return "NOT_COMPARABLE: missing price of this kind"
+        for s_, e_ in ((a, ea), (b, eb)):
+            st = self.status(s_, symbol, now, types=[e_.event_type.value])
+            if st != Readiness.READY:
+                return f"NOT_COMPARABLE: {s_.value} is {st.value}"
         ta, tb = ea.event_time or ea.received_at, eb.event_time or eb.received_at
         if abs(ta - tb) > self.max_pair_skew:
             return f"NOT_COMPARABLE: timestamps differ by {abs(ta - tb)}"
