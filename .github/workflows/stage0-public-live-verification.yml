@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   verify-public-exchanges:
-    name: Public read-only Binance + Toobit REST/WS (evidence)
+    name: Public Binance Spot/Futures + Toobit REST/WS (evidence)
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
