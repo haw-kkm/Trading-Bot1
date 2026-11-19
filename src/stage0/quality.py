@@ -82,6 +82,11 @@ class DataQualityGate:
         src = env_or_src.source.value if isinstance(env_or_src, MarketEnvelope) else str(env_or_src)
         self.issues.append(Issue(kind, src, symbol, detail))
 
+    def is_current(self, env: MarketEnvelope) -> bool:
+        """True only if `env` is the event the gate accepted as the latest state of its type (i.e. it passed
+        every check: not BACKFILL, not duplicate, not out of order, sane timestamp, not crossed)."""
+        return self._last.get((env.source.value, env.symbol, env.event_type.value)) is env
+
     def kinds(self):
         return [i.kind for i in self.issues]
 

@@ -147,6 +147,12 @@ class LiveRunner:
         self.last_msg_at: Optional[datetime] = None
         self.max_gap_s = 0.0
         self.started_at: Optional[datetime] = None
+        # Per-event-type LIVE WebSocket freshness bookkeeping (O(#types) memory). Only events the gate ACCEPTED
+        # as current count: BACKFILL, duplicate, out-of-order and bad-timestamp events never refresh a stream,
+        # and REST-sourced events never enter (channel must be "ws").
+        self.stream_started_at: Optional[datetime] = None
+        self.end_at: Optional[datetime] = None
+        self._stream: Dict[str, dict] = {}
 
     # ------------------------------------------------------------------ REST with classification/backoff
     def _server_wait(self, e: HttpError) -> Optional[float]:
@@ -204,12 +210,47 @@ class LiveRunner:
 
     def _ingest_all(self, envs, channel="rest"):
         for e in envs:
-            (self.ws_counts if channel == "ws" else self.rest_counts)[e.event_type.value] += 1
+            t = e.event_type.value
+            (self.ws_counts if channel == "ws" else self.rest_counts)[t] += 1
             self.c._ingest(e)
+            if channel == "ws" and self.c.gate.is_current(e):
+                self._note_live(t)
+
+    def _note_live(self, etype: str):
+        now = self.clock()
+        s = self._stream.get(etype)
+        if s is None:
+            lead = (now - self.stream_started_at).total_seconds() if self.stream_started_at else 0.0
+            self._stream[etype] = {"count": 1, "first": now, "last": now, "max_gap": max(0.0, lead)}
+        else:
+            s["max_gap"] = max(s["max_gap"], (now - s["last"]).total_seconds())
+            s["count"] += 1
+            s["last"] = now
+
+    def _open_stream_window(self):
+        if self.stream_started_at is None:
+            self.stream_started_at = self.clock()
+
+    def stream_report(self, end: Optional[datetime] = None) -> dict:
+        """Per-type live-stream freshness over the window [first socket opened, END OF DATA]. The window ends
+        at the end-of-data instant (before the socket close handshake), so a slow close is not counted as a
+        stall and the time before streaming started (REST bootstrap) is not either. max_gap_s covers the
+        leading gap (window start -> first live event), gaps between events, and the trailing gap (last event
+        -> window end)."""
+        end = end or self.end_at or self.clock()
+        start = self.stream_started_at
+        by_type = {}
+        for t, s in sorted(self._stream.items()):
+            by_type[t] = {"live_count": s["count"], "first_at": s["first"].isoformat(), "last_at": s["last"].isoformat(),
+                          "max_gap_s": round(max(s["max_gap"], (end - s["last"]).total_seconds()), 1),
+                          "end_age_s": round(max(0.0, (end - s["last"]).total_seconds()), 1)}
+        return {"window_start": start.isoformat() if start else None, "window_end": end.isoformat(),
+                "window_s": round((end - start).total_seconds(), 1) if start else None, "by_type": by_type}
 
     def _capture_end(self, src: Source, common: str):
         """Gate state at the END OF DATA (before the socket close handshake, which can take seconds)."""
         now = self.clock()
+        self.end_at = now
         core = CORE_TYPES[src]
         self.end_state = {"at": now.isoformat(), "core_types": list(core),
                           "readiness": self.c.gate.status(src, common, now, types=core).value,
@@ -270,7 +311,7 @@ class LiveRunner:
                 self._note(f)
                 self.c.gate.on_reference_failed(src, common, etype, f"{f.kind} {f.status or ''} {f.reason}")
             except (EnvelopeError, KeyError, ValueError, TypeError) as e:
-                self.c.rejected.append({"endpoint": path, "error": f"{type(e).__name__}: {e}"})
+                self.c.reject({"endpoint": path, "error": f"{type(e).__name__}: {e}"})
                 self.c.gate.on_reference_failed(src, common, etype, f"unparsable: {type(e).__name__}")
 
     # ------------------------------------------------------------------ stream bookkeeping
@@ -290,7 +331,9 @@ class LiveRunner:
         path = "/fapi/v1/depth" if src == Source.BINANCE_FUTURES else "/api/v3/depth"
         P = binance.FUTURES if src == Source.BINANCE_FUTURES else binance.SPOT
         raw = await self._fetch(src, path, {"symbol": symbol, "limit": 1000})
-        self.c._ingest(P.parse_depth_snapshot(symbol, raw, self.clock()))
+        snap = P.parse_depth_snapshot(symbol, raw, self.clock())
+        self.rest_counts[snap.event_type.value] += 1          # REST bootstrap: counted so file/summary counts reconcile
+        self.c._ingest(snap)
 
     async def _backoff_or_give_up(self, src, common, attempt, delays, why):
         self.c.gate.on_disconnect(src)
@@ -309,6 +352,7 @@ class LiveRunner:
             conn = None
             try:
                 conn = await self.ws.open(src, url)
+                self._open_stream_window()
                 self.c.gate.on_connect(src, [common] if with_book else [])
                 if with_book:
                     self._begin_sync(src, common)
@@ -320,7 +364,7 @@ class LiveRunner:
                     try:
                         self._ingest_all(P.parse(json.loads(raw), self.clock()), "ws")
                     except (EnvelopeError, KeyError, ValueError, TypeError) as e:
-                        self.c.rejected.append({"error": f"{type(e).__name__}: {e}"})
+                        self.c.reject({"error": f"{type(e).__name__}: {e}"})
                     b = self.c.books.get((src, common)) if with_book else None
                     if b is not None and b.state == BookState.INVALID:
                         self.resyncs += 1
@@ -374,6 +418,7 @@ class LiveRunner:
             conn = None
             try:
                 conn = await self.ws.open(src, WS_URLS[src])
+                self._open_stream_window()
                 self.c.gate.on_connect(src, [common])
                 for t in topics:
                     await conn.send(json.dumps(toobit.ws_subscribe_message(t, symbol)))
@@ -395,7 +440,7 @@ class LiveRunner:
                     except toobit.SubscriptionError as e:
                         raise FatalDataError(str(e))          # a rejected subscription cannot be retried away
                     except (EnvelopeError, KeyError, ValueError, TypeError) as e:
-                        self.c.rejected.append({"error": f"{type(e).__name__}: {e}"})
+                        self.c.reject({"error": f"{type(e).__name__}: {e}"})
                 self._capture_end(src, common)
             except (WsClosed, asyncio.TimeoutError, OSError) as e:
                 attempt = await self._backoff_or_give_up(src, common, attempt, delays, str(e) or type(e).__name__)
@@ -570,10 +615,19 @@ def build_policy(args) -> NetworkPolicy:
 
 
 def _write(out, col):
-    if out:
-        with open(out, "w", encoding="utf-8") as fh:
-            for e in col.envelopes:
-                fh.write(e.to_json() + "\n")
+    """Write the envelope JSONL (LF line endings on every OS) and return what was written, so the summary can
+    be cross-checked against the file by an independent verifier. None if no file was requested."""
+    if not out:
+        return None
+    import hashlib
+    h, n = hashlib.sha256(), 0
+    with open(out, "w", encoding="utf-8", newline="\n") as fh:
+        for e in col.envelopes:
+            line = e.to_json() + "\n"
+            fh.write(line)
+            h.update(line.encode("utf-8"))
+            n += 1
+    return {"lines": n, "sha256": h.hexdigest()}
 
 
 def main(argv=None) -> int:
@@ -622,7 +676,7 @@ def main(argv=None) -> int:
         code, err = EXIT_INTEGRITY, f"data integrity: {type(e).__name__}: {e}"
     except Exception as e:                                  # internal error: never report as success
         code, err = EXIT_INTEGRITY, f"internal error: {type(e).__name__}"
-    _write(args.out, col)
+    written = _write(args.out, col)
     common = toobit_to_common(args.symbol) if src == Source.TOOBIT_FUTURES else binance_to_common(
         args.symbol, src == Source.BINANCE_FUTURES)
     print(json.dumps({"exit_code": code, "error": err, "unhealthy_reasons": reasons,
@@ -631,7 +685,8 @@ def main(argv=None) -> int:
                       "resyncs": runner.resyncs, "rest_retries": runner.rest_retries,
                       "ws_events_by_type": dict(runner.ws_counts), "rest_events_by_type": dict(runner.rest_counts),
                       "rejected_by_error": dict(Counter(r["error"][:120] for r in col.rejected)),
-                      "end_of_collection": runner.end_state,
+                      "end_of_collection": runner.end_state, "stream_freshness": runner.stream_report(),
+                      "events_file_written": written,
                       "rest_failures": runner.rest_failures, "max_gap_s": round(runner.max_gap_s, 1),
                       }, indent=2))
     if err:

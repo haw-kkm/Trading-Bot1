@@ -1,5 +1,12 @@
 name: stage0 public live verification
 
+# Two jobs on purpose:
+#   collect-evidence    runs the verifier, uploads the evidence and a per-market result table. It succeeds when the
+#                       verifier produced a verdict (exit 0/1/2) - it does NOT decide PASS.
+#   verification-gate   is the only job that turns the verdict into the workflow result. It is green ONLY for
+#                       verifier exit 0 (every required stage PASS). Exit 1 (real failure) and exit 2 (environment
+#                       block such as Binance HTTP 451, NOT_RUN or INCONCLUSIVE: full success NOT proven) are red.
+# HTTP 451 is reported as observed (REST=FAIL, WS=NOT_RUN, environment_blocked) and is never bypassed or promoted.
 on:
   push:
     branches:
@@ -10,10 +17,12 @@ permissions:
   contents: read
 
 jobs:
-  verify-public-exchanges:
-    name: Public Binance Spot/Futures + Toobit REST/WS (evidence)
+  collect-evidence:
+    name: Collect public-data evidence (Binance Spot/Futures + Toobit REST/WS)
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    outputs:
+      exit_code: ${{ steps.verify.outputs.exit_code }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,18 +31,21 @@ jobs:
       - name: Install pinned project requirements
         run: python -m pip install -r requirements.txt
       - name: Verify live public market data and record evidence
+        id: verify
         run: |
           set +e
-          python tools/stage0_live_verify.py             --seconds 30             --timeout-seconds 150             --approve-toobit-public-readonly             --output-dir stage0-live-evidence
+          python tools/stage0_live_verify.py --seconds 30 --timeout-seconds 150 --approve-toobit-public-readonly \
+            --output-dir stage0-live-evidence --github-annotations --summary-file "$GITHUB_STEP_SUMMARY"
           code=$?
           set -e
-          # 0 = all PASS, 1 = at least one FAIL (job fails), 2 = no FAIL but NOT_RUN/INCONCLUSIVE stages
-          # (e.g. Binance HTTP 451 from the GitHub runner region: reported, never bypassed, never PASS).
-          if [ "$code" -eq 2 ]; then
-            echo "::warning::Not every stage PASSED (NOT_RUN/INCONCLUSIVE). See verification-report.json."
-            exit 0
-          fi
-          exit $code
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          # 0 = all required stages PASS | 1 = real failure | 2 = full success NOT proven (451 / NOT_RUN / INCONCLUSIVE).
+          # All three are valid verdicts and the evidence is complete; the verification-gate job enforces them.
+          # Any other code means the verifier itself crashed: fail here.
+          case "$code" in
+            0|1|2) exit 0 ;;
+            *) echo "::error::verifier crashed with exit code $code"; exit "$code" ;;
+          esac
       - name: Archive reproducible evidence even when verification fails
         if: always()
         uses: actions/upload-artifact@v4
@@ -42,3 +54,24 @@ jobs:
           path: stage0-live-evidence/
           retention-days: 14
           if-no-files-found: warn
+
+  verification-gate:
+    name: Verification gate (green only if every required stage PASSED)
+    needs: collect-evidence
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce the verifier verdict
+        env:
+          COLLECT_RESULT: ${{ needs.collect-evidence.result }}
+          CODE: ${{ needs.collect-evidence.outputs.exit_code }}
+        run: |
+          if [ "$COLLECT_RESULT" != "success" ]; then
+            echo "::error::evidence collection did not complete ($COLLECT_RESULT): nothing is verified"; exit 1
+          fi
+          case "$CODE" in
+            0) echo "All required stages PASSED in this runner (public data only; not trading approval)." ;;
+            1) echo "::error::Verification FAILED: at least one required stage failed for a reason other than an environment block. See verification-report.json."; exit 1 ;;
+            2) echo "::error::NOT fully verified: environment block (e.g. Binance HTTP 451, not bypassed), NOT_RUN or INCONCLUSIVE stages remain. The report overall is not PASS."; exit 1 ;;
+            *) echo "::error::unknown verifier exit code '$CODE'"; exit 1 ;;
+          esac

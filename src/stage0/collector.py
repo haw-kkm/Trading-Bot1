@@ -177,6 +177,10 @@ class Collector:
     books: Dict[tuple, LocalOrderBook] = field(default_factory=dict)
     network_calls: int = 0           # real network requests made by THIS object (always 0 in FIXTURE)
 
+    def reject(self, entry: dict):
+        """Quarantine an unparsable message (never used as data)."""
+        self.rejected.append(entry)
+
     def _book(self, env: MarketEnvelope) -> LocalOrderBook:
         k = (env.source, env.symbol)
         if k not in self.books:
@@ -267,7 +271,7 @@ class Collector:
             try:
                 self.handle(json.loads(line))
             except (EnvelopeError, KeyError, ValueError) as e:
-                self.rejected.append({"line": i, "error": f"{type(e).__name__}: {e}"})
+                self.reject({"line": i, "error": f"{type(e).__name__}: {e}"})
         return self
 
 

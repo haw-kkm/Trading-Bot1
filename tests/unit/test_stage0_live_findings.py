@@ -240,8 +240,17 @@ def test_tool_inconclusive_when_docs_leave_meaning_open_or_data_empty():
     assert t.judge_rest({}, [])[0] == "FAIL"
 
 
+def _fresh(*types, gap=1.0):
+    return {"window_start": "t0", "window_end": "t1", "window_s": 30.0,
+            "by_type": {t: {"live_count": 3, "first_at": "a", "last_at": "b", "max_gap_s": gap, "end_age_s": 0.5} for t in types}}
+
+
+GOOD_EVIDENCE = {"status": "PASS", "reason": "reconciled"}      # judge_ws no longer accepts a PASS without verified evidence
+
+
 def good_summary(**kw):
     s = {"exit_code": 0, "envelopes": 100, "rejected": 0, "max_gap_s": 1.0, "ws_events_by_type": {"TRADE": 5, "BOOK_TICKER": 9, "MARK_PRICE": 3},
+         "stream_freshness": _fresh("TRADE", "BOOK_TICKER", "MARK_PRICE"),
          "end_of_collection": {"readiness": "READY", "core_types": ["TRADE"], "per_type": {}}}
     s.update(kw)
     return s
@@ -249,10 +258,11 @@ def good_summary(**kw):
 
 def test_tool_ws_stages_each_judged_separately():
     t = _tool()
-    ev = {"invalid_lines": 0}
+    ev = GOOD_EVIDENCE
     req = ("TRADE", "BOOK_TICKER", "MARK_PRICE")
     ok = t.judge_ws({"timed_out": False}, good_summary(), req, ev, 20.0)
-    assert {k: v["status"] for k, v in ok.items()} == {"ws_received": "PASS", "ws_parsed": "PASS", "ws_fresh": "PASS", "gate_ready": "PASS"}
+    assert {k: v["status"] for k, v in ok.items()} == {"ws_received": "PASS", "ws_parsed": "PASS", "ws_fresh": "PASS", "gate_ready": "PASS",
+                                                                  "evidence_integrity": "PASS"}
     miss = t.judge_ws({"timed_out": False}, good_summary(ws_events_by_type={"TRADE": 1}), req, ev, 20.0)
     assert miss["ws_received"]["status"] == "FAIL" and set(miss["ws_received"]["missing_types"]) == {"BOOK_TICKER", "MARK_PRICE"}
     rej = t.judge_ws({"timed_out": False}, good_summary(rejected=31, envelopes=447), req, ev, 20.0)
