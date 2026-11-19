@@ -358,6 +358,9 @@ def test_resolving_unknown_does_not_resume_entries_only_reset_does(store):
     # a brand-new engine (other process / restart) is also still blocked: the freeze is persisted
     e_other = _engine(store, PaperExchange(0.0))
     assert e_other.new_entry_blocked is True
+    # the resolved order's exchange lifecycle (NEW) is still non-terminal => still in flight (P1-2)
+    assert e.manual_operator_reset()["kind"] == "IN_FLIGHT_ORDERS"
+    store.record_lifecycle(unk.intent_id, "CANCELED", 0.0)       # exchange reports it ended
     # open exposure keeps the reset refused even though UNKNOWN is resolved
     ex.positions["BTCUSDT"] = 0.1
     assert e.manual_operator_reset()["kind"] == "EXPOSURE_PRESENT"

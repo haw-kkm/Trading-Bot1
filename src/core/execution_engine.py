@@ -124,6 +124,8 @@ class ExecutionEngine:
 
     # Test/bootstrap hook only: callable returning an OrderStore for engines built without one.
     default_store_factory = None
+    # Pause between the two pre-release verification passes (mitigation for delayed fills; 0 = none)
+    reset_settle_s = 0.0
 
     def __init__(self, order_store=None, live_trading_enabled: bool = False,
                  alert_sink: Optional[AlertSink] = None):
@@ -749,6 +751,51 @@ class ExecutionEngine:
                 self.alert_sink.alert("ERROR", f"could not persist entry freeze: {exc}",
                                       "ExecutionEngine")
 
+    def _reset_verify(self, failed, quiet: bool = False) -> Optional[Dict[str, Any]]:
+        """One full verification pass for manual_operator_reset. Returns a FAILED dict, or None
+        if everything verified clean. Anything missing / stale / erroring => NOT clean."""
+        def fail(kind, reason, **extra):
+            if quiet:
+                return {"status": "FAILED", "kind": kind, "reason": reason, **extra}
+            return failed(kind, reason, **extra)
+
+        if self.order_store is None:
+            return fail("INCOMPLETE_VERIFICATION", "no order store: cannot verify unresolved intents")
+        try:
+            if self.order_store.has_unresolved_intents():
+                return fail("UNRESOLVED_INTENTS",
+                            "unresolved order intents exist (SUBMISSION_UNKNOWN/pending); reconcile first")
+            # ACCEPTED orders whose exchange lifecycle is not known terminal are still IN FLIGHT:
+            # try to settle them by query first; whatever stays open blocks the reset.
+            if self.submitter is not None:
+                try:
+                    self.submitter.refresh_all_lifecycles()
+                except Exception:
+                    pass
+            if self.order_store.list_lifecycle_open():
+                return fail("IN_FLIGHT_ORDERS",
+                            "accepted order(s) with non-terminal / unknown exchange lifecycle exist")
+        except Exception as exc:
+            return fail("INCOMPLETE_VERIFICATION", f"cannot read order intents: {exc}")
+        try:
+            positions = self._parse_positions(self._section("get_all_positions", "positions"))
+            open_orders = self._section("get_open_orders", "orders")
+            conditional = self._section("get_conditional_orders", "orders")
+        except SnapshotIncomplete as exc:
+            kind = "NOT_IMPLEMENTED" if exc.kind == "NOT_IMPLEMENTED" else "INCOMPLETE_VERIFICATION"
+            return fail(kind, f"{exc} -- reset NOT approved; this does NOT mean a position exists")
+        live = [p for p in positions if p["quantity"] > _QTY_TOL]
+        if live:
+            return fail("EXPOSURE_PRESENT", "open futures position(s) exist",
+                        symbols=sorted({p["symbol"] for p in live}))
+        if open_orders:
+            return fail("OPEN_ORDERS_PRESENT", f"{len(open_orders)} open order(s) exist "
+                        "(may open new exposure); cancel and re-verify")
+        if conditional:
+            return fail("CONDITIONAL_ORDERS_PRESENT", f"{len(conditional)} conditional/SL-TP order(s) "
+                        "exist; separate cleanup policy required (not auto-cancelled)")
+        return None
+
     def manual_operator_reset(self) -> Dict[str, Any]:
         """Manual operator reset after emergency lock / SUBMISSION_UNKNOWN freeze.
 
@@ -772,33 +819,15 @@ class ExecutionEngine:
             return {"status": "FAILED", "kind": kind, "verification_incomplete": unverified,
                     "reason": reason, **extra}
 
-        if self.order_store is None:
-            return failed("INCOMPLETE_VERIFICATION", "no order store: cannot verify unresolved intents")
-        try:
-            if self.order_store.has_unresolved_intents():
-                return failed("UNRESOLVED_INTENTS",
-                              "unresolved order intents exist (SUBMISSION_UNKNOWN/pending); reconcile first")
-        except Exception as exc:
-            return failed("INCOMPLETE_VERIFICATION", f"cannot read order intents: {exc}")
-
-        try:
-            positions = self._parse_positions(self._section("get_all_positions", "positions"))
-            open_orders = self._section("get_open_orders", "orders")
-            conditional = self._section("get_conditional_orders", "orders")
-        except SnapshotIncomplete as exc:
-            kind = "NOT_IMPLEMENTED" if exc.kind == "NOT_IMPLEMENTED" else "INCOMPLETE_VERIFICATION"
-            return failed(kind, f"{exc} -- reset NOT approved; this does NOT mean a position exists")
-
-        live = [p for p in positions if p["quantity"] > _QTY_TOL]
-        if live:
-            return failed("EXPOSURE_PRESENT", "open futures position(s) exist",
-                          symbols=sorted({p["symbol"] for p in live}))
-        if open_orders:
-            return failed("OPEN_ORDERS_PRESENT", f"{len(open_orders)} open order(s) exist "
-                          "(may open new exposure); cancel and re-verify")
-        if conditional:
-            return failed("CONDITIONAL_ORDERS_PRESENT", f"{len(conditional)} conditional/SL-TP order(s) "
-                          "exist; separate cleanup policy required (not auto-cancelled)")
+        # Pass 1 and pass 2 (after an optional settle delay) must BOTH be clean: a fill that was
+        # in flight during pass 1 is likely to show up by pass 2. This narrows, never closes,
+        # the exchange-query -> DB-release time gap (see docs/plans/track-a-safety-guarantees.md).
+        for pass_no in (1, 2):
+            if pass_no == 2 and self.reset_settle_s > 0:
+                time.sleep(self.reset_settle_s)
+            bad = self._reset_verify(failed)
+            if bad is not None:
+                return bad
         try:
             released = self.order_store.release_entry_freeze()   # DB re-checks under the gate lock
         except Exception as exc:
@@ -806,13 +835,31 @@ class ExecutionEngine:
         if not released:
             return failed("UNRESOLVED_INTENTS", "an unresolved intent appeared during reset")
 
+        # Post-release verification: a delayed fill / late order that landed between the last
+        # query and the release is caught here and the freeze is RE-APPLIED. In-memory flags are
+        # only relaxed after this passes.
+        post = self._reset_verify(failed, quiet=True)
+        if post is not None:
+            try:
+                self.order_store.freeze_entries(f"reset reverted: {post['kind']}")
+            except Exception as exc:
+                self.alert_sink.alert("ERROR", f"could not re-apply entry freeze after failed "
+                                      f"post-release check: {exc}", "ExecutionEngine")
+            self.new_entry_blocked = True
+            self.alert_sink.alert("ERROR", f"post-release verification failed [{post['kind']}]; "
+                                  "entries re-frozen", "ExecutionEngine")
+            return {**post, "status": "FAILED", "kind": "POST_RELEASE_CHANGE",
+                    "underlying_kind": post["kind"], "entries_refrozen": True}
+
         self._emergency_episodes.clear()
         self.emergency_lock = EmergencyLockState.UNLOCKED
         self.state = ExecutionState.READY
         self.new_entry_blocked = False
         # Account drawdown/risk-limit re-validation needs account-equity data this adapter does
         # not provide: reported, not silently assumed.
-        return {"status": "SUCCESS", "unverified": ["account_drawdown_limit"]}
+        return {"status": "SUCCESS",
+                "unverified": ["account_drawdown_limit",
+                               "orders_in_flight_after_post_release_check"]}
 
     def create_order_on_fill(self, symbol: str, side: str, quantity: float, price: float) -> str:
         """Create order record on fill.

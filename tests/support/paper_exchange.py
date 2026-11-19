@@ -39,6 +39,8 @@ class PaperExchange:
         self.fail_sends = None                    # exception to raise on every order send
         self.equity = 100000.0
         self.equity_mode = "ok"                   # ok | raise | stale | malformed | zero
+        self.on_account_query = None              # test hook: fn(kind, call_no) after each account query
+        self._calls = {}
         self._n = 0
 
     # ---- orders -----------------------------------------------------------------------
@@ -94,6 +96,11 @@ class PaperExchange:
         return rec
 
     # ---- account queries ---------------------------------------------------------------
+    def _hook(self, kind):
+        self._calls[kind] = self._calls.get(kind, 0) + 1
+        if self.on_account_query:
+            self.on_account_query(kind, self._calls[kind])
+
     def _wrap(self, mode, key, rows):
         if mode == "raise":
             raise ConnectionError("account query failed")
@@ -110,7 +117,9 @@ class PaperExchange:
                 for s, q in self.positions.items() if abs(q) > 1e-12]
         if self.positions_mode == "malformed":
             rows = [{"symbol": self.symbol, "side": "???", "quantity": "x"}]
-        return self._wrap(self.positions_mode, "positions", rows)
+        out = self._wrap(self.positions_mode, "positions", rows)
+        self._hook("positions")
+        return out
 
     def get_position_mode(self):
         if self.mode == "raise":
@@ -118,7 +127,9 @@ class PaperExchange:
         return self.mode
 
     def get_open_orders(self):
-        return self._wrap(self.open_orders_mode, "orders", [dict(o) for o in self.open_orders])
+        out = self._wrap(self.open_orders_mode, "orders", [dict(o) for o in self.open_orders])
+        self._hook("open_orders")
+        return out
 
     def get_conditional_orders(self):
         return self._wrap(self.conditional_mode, "orders", [dict(o) for o in self.conditional_orders])
