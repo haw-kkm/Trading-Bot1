@@ -126,51 +126,41 @@ def test_hybrid_emergency_rollback_retry_sl_tp():
     # Trigger rollback with retries
     result = engine.trigger_emergency_rollback("BTCUSDT", "BUY", 0.5, 50000.0)
 
-    # Should retry and eventually succeed
-    assert result["status"] == "ROLLBACK_COMPLETED"
+    # Retried and registered: position stays OPEN (protected) => NOT a completed rollback
+    assert result["status"] == "ROLLBACK_PROTECTED_LOCKED"
     assert result["sl_tp_retries_attempted"] == 3
     assert result["sl_tp_registered"] is True
 
 
+def _paper(position=0.5, **kw):
+    from tests.support.paper_exchange import PaperExchange
+    return PaperExchange(position=position, **kw)
+
+
 def test_hybrid_emergency_rollback_ioc_exit():
     engine = ExecutionEngine()
-
-    # Mock Toobit client that fails all retries
-    engine.toobit_client = MockToobitClient(sl_tp_fail=True, ioc_fill=True)
-
-    # Trigger rollback
+    engine.toobit_client = _paper(0.5)       # IOC fills fully (verified by order query + position)
     result = engine.trigger_emergency_rollback("BTCUSDT", "BUY", 0.5, 50000.0)
-
-    # Should fall back to IOC exit
     assert result["status"] == "ROLLBACK_COMPLETED"
     assert result["ioc_exit_executed"] is True
-    assert result["ioc_fill_status"] == "FILLED"
+    assert all(result["stages"][k] for k in (
+        "close_confirmed", "entry_orders_cleared_confirmed", "protective_orders_cleared_confirmed"))
 
 
 def test_hybrid_emergency_rollback_market_close_fallback():
     engine = ExecutionEngine()
-
-    # Mock Toobit client that fails retries and IOC doesn't fill
-    engine.toobit_client = MockToobitClient(sl_tp_fail=True, ioc_fill=False)
-
-    # Trigger rollback
+    ex = _paper(0.5)
+    ex.ioc_fill_ratio = 0.0                  # IOC confirmed unfilled (terminal, executedQty 0)
+    engine.toobit_client = ex
     result = engine.trigger_emergency_rollback("BTCUSDT", "BUY", 0.5, 50000.0)
-
-    # Should fall back to market close
     assert result["status"] == "ROLLBACK_COMPLETED"
     assert result["market_close_executed"] is True
 
 
 def test_extreme_conditions_bypass():
     engine = ExecutionEngine()
-
-    # Mock extreme conditions
-    engine.toobit_client = MockToobitClient(extreme_conditions=True)
-
-    # Trigger rollback in extreme conditions
+    engine.toobit_client = _paper(0.5, extreme=True)
     result = engine.trigger_emergency_rollback("BTCUSDT", "BUY", 0.5, 50000.0)
-
-    # Should bypass retries/IOC and go straight to market liquidation
     assert result["status"] == "ROLLBACK_COMPLETED"
     assert result["extreme_conditions_bypass"] is True
     assert result["market_liquidation_executed"] is True
@@ -211,46 +201,40 @@ def test_emergency_lock_state():
 
 def test_manual_operator_reset():
     engine = ExecutionEngine()
-
-    # Mock Toobit client
-    engine.toobit_client = MockToobitClient()
-
-    # Enter emergency lock
+    engine.toobit_client = _paper(0.0)       # flat account, no orders
     engine.enter_emergency_lock()
-
-    # Verify position is 0
-    assert engine.reconcile_position("BTCUSDT")["position_size"] == 0.0
-
-    # Manual reset
     result = engine.manual_operator_reset()
-
     assert result["status"] == "SUCCESS"
     assert engine.emergency_lock == EmergencyLockState.UNLOCKED
     assert engine.state == ExecutionState.READY
     assert engine.new_entry_blocked is False
 
 
-def test_integration_sl_tp_failure_emergency_liquidation():
-    """Integration test simulating SL/TP API failure and verifying safe emergency liquidation."""
+def test_manual_operator_reset_refuses_when_adapter_lacks_account_queries():
+    """Legacy mock has only get_position(symbol): whole-account verification is NOT implemented,
+    so reset must stay refused (and say it is a verification failure, not a position)."""
     engine = ExecutionEngine()
+    engine.toobit_client = MockToobitClient()
+    engine.enter_emergency_lock()
+    result = engine.manual_operator_reset()
+    assert result["status"] == "FAILED" and result["kind"] == "NOT_IMPLEMENTED"
+    assert result["verification_incomplete"] is True
+    assert engine.emergency_lock == EmergencyLockState.LOCKED
 
-    # Mock Toobit client
-    engine.toobit_client = MockToobitClient(sl_tp_fail=True, ioc_fill=False)
 
-    # Simulate order fill
-    order_id = engine.create_order_on_fill("BTCUSDT", "BUY", 0.5, 50000.0)
-
-    # Trigger SL/TP registration which should fail
+def test_integration_sl_tp_failure_emergency_liquidation():
+    """SL/TP API failure -> rollback closes the ACTUAL position and verifies a clean account."""
+    engine = ExecutionEngine()
+    ex = _paper(0.5)
+    ex.ioc_fill_ratio = 0.0
+    engine.toobit_client = ex
+    engine.create_order_on_fill("BTCUSDT", "BUY", 0.5, 50000.0)
     token = _make_validated_order()
     sl_tp_result = engine.register_sl_tp("BTCUSDT", "BUY", 0.5, 50000.0, 49000.0, 51000.0, validated_order=token)
-
-    # Should trigger rollback
     assert sl_tp_result["status"] == "ROLLBACK_TRIGGERED"
-
-    # Verify final state
     assert engine.emergency_lock == EmergencyLockState.LOCKED
     assert engine.state == ExecutionState.EMERGENCY_LOCKED
-    assert engine.reconcile_position("BTCUSDT")["position_size"] == 0.0
+    assert ex.positions["BTCUSDT"] == 0.0
 
 
 # Mock Toobit Client for testing
@@ -271,16 +255,16 @@ class MockToobitClient:
             return {"status": "FAILED", "error": "SL/TP registration failed"}
         return {"status": "SUCCESS", "sl_registered": True, "tp_registered": True}
 
-    def execute_reduce_only_order(self, symbol, side, quantity, price, order_type="LIMIT", client_order_id=None):
+    def execute_reduce_only_order(self, symbol, side, quantity, price, order_type="LIMIT", client_order_id=None, **_kw):
         return {"status": "SUCCESS", "reduce_only": True, "order_type": order_type}
 
-    def execute_ioc_order(self, symbol, side, quantity, price, client_order_id=None):
+    def execute_ioc_order(self, symbol, side, quantity, price, client_order_id=None, **_kw):
         if self.ioc_fill:
             self.position_size = 0.0
             return {"status": "SUCCESS", "time_in_force": "IOC", "order_type": "LIMIT", "fill_status": "FILLED"}
         return {"status": "SUCCESS", "time_in_force": "IOC", "order_type": "LIMIT", "fill_status": "UNFILLED"}
 
-    def execute_market_order(self, symbol, side, quantity, client_order_id=None):
+    def execute_market_order(self, symbol, side, quantity, client_order_id=None, **_kw):
         self.position_size = 0.0
         return {"status": "SUCCESS", "order_type": "MARKET"}
 

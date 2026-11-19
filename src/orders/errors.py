@@ -35,3 +35,8 @@ class PolicyViolation(Exception):
 
 class LiveTradingDisabled(Exception):
     """Live order placement is disabled until separately approved."""
+
+
+class EntriesBlocked(Exception):
+    """New ENTRY submit authority refused: entries are frozen / an unresolved
+    SUBMISSION_UNKNOWN exists. The authorization is NOT consumed."""

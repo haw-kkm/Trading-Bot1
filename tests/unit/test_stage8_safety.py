@@ -34,17 +34,17 @@ class RecordingClient:
         self._maybe_raise("register_sl_tp")
         return {"status": "SUCCESS" if self.sl_tp_ok else "FAILED"}
 
-    def execute_reduce_only_order(self, symbol, side, quantity, price, order_type="LIMIT", client_order_id=None):
+    def execute_reduce_only_order(self, symbol, side, quantity, price, order_type="LIMIT", client_order_id=None, **_kw):
         self.calls.append(("reduce_only", symbol, side, quantity, price))
         self._maybe_raise("execute_reduce_only_order")
         return {"status": "SUCCESS"}
 
-    def execute_ioc_order(self, symbol, side, quantity, price, client_order_id=None):
+    def execute_ioc_order(self, symbol, side, quantity, price, client_order_id=None, **_kw):
         self.calls.append(("ioc", symbol, side, quantity, price))
         self._maybe_raise("execute_ioc_order")
         return {"status": "SUCCESS", "fill_status": "FILLED"}
 
-    def execute_market_order(self, symbol, side, quantity, client_order_id=None):
+    def execute_market_order(self, symbol, side, quantity, client_order_id=None, **_kw):
         self.calls.append(("market", symbol, side, quantity))
         self._maybe_raise("execute_market_order")
         return {"status": "SUCCESS"}
@@ -287,9 +287,12 @@ def test_signature_is_hmac_bound_to_secret_key(monkeypatch):
     assert RiskEngine.verify_token(token) is False
 
 
-def test_emergency_rollback_uses_caller_price_via_persisted_intent():
+def test_emergency_rollback_uses_actual_position_not_caller_values():
+    from tests.support.paper_exchange import PaperExchange
     engine = ExecutionEngine()
-    engine.toobit_client = RecordingClient(sl_tp_ok=False)
-    engine.trigger_emergency_rollback("BTCUSDT", "BUY", 0.1, 42000.0)
-    ioc = [c for c in engine.toobit_client.calls if c[0] == "ioc"]
-    assert ioc and ioc[0][4] == 42000.0
+    ex = PaperExchange(position=-0.3)        # actually SHORT 0.3; caller wrongly says BUY 0.5
+    engine.toobit_client = ex
+    result = engine.trigger_emergency_rollback("BTCUSDT", "BUY", 0.5, 42000.0)
+    assert result["status"] == "ROLLBACK_COMPLETED"
+    kind, side, qty, _cid, reduce_only = ex.sent[0]
+    assert (kind, side, qty, reduce_only) == ("ioc", "BUY", 0.3, True)  # buy back exactly 0.3

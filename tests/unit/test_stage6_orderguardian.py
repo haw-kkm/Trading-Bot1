@@ -244,13 +244,13 @@ class MockToobitClient:
             return {"status": "FAILED", "error": "SL/TP registration failed"}
         return {"status": "SUCCESS", "sl_registered": True, "tp_registered": True}
 
-    def execute_reduce_only_order(self, symbol, side, quantity, price, order_type="LIMIT", client_order_id=None):
+    def execute_reduce_only_order(self, symbol, side, quantity, price, order_type="LIMIT", client_order_id=None, **_kw):
         return {"status": "SUCCESS", "reduce_only": True, "order_type": order_type}
 
-    def execute_ioc_order(self, symbol, side, quantity, price, client_order_id=None):
+    def execute_ioc_order(self, symbol, side, quantity, price, client_order_id=None, **_kw):
         return {"status": "SUCCESS", "time_in_force": "IOC", "order_type": "LIMIT", "fill_status": "FILLED"}
 
-    def execute_market_order(self, symbol, side, quantity, client_order_id=None):
+    def execute_market_order(self, symbol, side, quantity, client_order_id=None, **_kw):
         return {"status": "SUCCESS", "order_type": "MARKET"}
 
     def get_position(self, symbol):

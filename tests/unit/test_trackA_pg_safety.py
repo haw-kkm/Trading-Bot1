@@ -17,8 +17,8 @@ from src.core.execution_engine import EmergencyLockState, ExecutionEngine
 from src.core.models import TradeHypothesis
 from src.core.risk_engine import RiskEngine
 from src.orders.errors import (
-    ActiveEmergencyOrderExists, AuthorizationAlreadyConsumed, ExchangeRejected, IllegalTransition,
-    PersistenceFailed,
+    ActiveEmergencyOrderExists, AuthorizationAlreadyConsumed, EntriesBlocked, ExchangeRejected,
+    IllegalTransition, PersistenceFailed,
 )
 from src.orders.pg_store import IntentState, OrderStore
 from src.orders.submitter import SafeSubmitter
@@ -45,14 +45,14 @@ class FakeExchange:
         return {"status": "SUCCESS", "orderId": f"X{len(self.sent)}", "clientOrderId": cid,
                 "fill_status": "FILLED" if self.ioc_fill else "UNFILLED"}
 
-    def execute_market_order(self, symbol, side, quantity, client_order_id=None):
+    def execute_market_order(self, symbol, side, quantity, client_order_id=None, reduce_only=False):
         return self._do("market", client_order_id)
 
-    def execute_ioc_order(self, symbol, side, quantity, price, client_order_id=None):
+    def execute_ioc_order(self, symbol, side, quantity, price, client_order_id=None, reduce_only=False):
         return self._do("ioc", client_order_id)
 
     def execute_reduce_only_order(self, symbol, side, quantity, price, order_type="LIMIT",
-                                  client_order_id=None):
+                                  client_order_id=None, reduce_only=True):
         return self._do("reduce", client_order_id)
 
     def query_order(self, cid):
@@ -272,7 +272,7 @@ def test_process_kill_during_send_recovers_as_unknown_never_resent(store, pg_dsn
     assert sub.recover_on_startup(lease_s=0) == []     # nothing auto-submitted
     unk = s2.list_by_state(IntentState.SUBMISSION_UNKNOWN)
     assert len(unk) == 1 and unk[0].last_error == "claim_abandoned_or_process_died"
-    with pytest.raises(IllegalTransition):
+    with pytest.raises((IllegalTransition, EntriesBlocked)):   # state machine / entry gate
         sub.submit_persisted(unk[0].intent_id)
     sub.recover_on_startup(); sub.reconcile_all()
     assert sends == []
@@ -408,8 +408,10 @@ def test_engine_timeout_no_rollback_no_resend_and_blocks_entries(store):
     assert out["status"] == "SUBMISSION_UNKNOWN" and getattr(e, "rollback_calls", 0) == 0
     retry = e.execute_market_order("BTCUSDT", "BUY", 0.1, validated_order=tok)   # blocked by freeze
     assert retry["status"] == "REJECTED" and "freeze" in retry["reason"]
-    e.new_entry_blocked = False   # even if the freeze were lifted, the consumed token cannot resend
-    assert e.execute_market_order("BTCUSDT", "BUY", 0.1, validated_order=tok)["status"] == "DUPLICATE_SUPPRESSED"
+    e.new_entry_blocked = False   # in-memory flag cleared: the PERSISTED gate still refuses
+    again = e.execute_market_order("BTCUSDT", "BUY", 0.1, validated_order=tok)
+    assert again["status"] == "REJECTED" and "entry gate closed (DB)" in again["reason"]
+    assert store.authorization_status(tok.authorization_id) == "CONSUMED"
     assert len(client.sent) == 1
     assert e.manual_operator_reset()["status"] == "FAILED"   # unresolved UNKNOWN blocks reset
 
@@ -466,21 +468,26 @@ def test_engine_without_store_fails_closed():
 
 
 # --------------------------------------------- emergency liquidation duplicates
+def _paper(position=0.5, **kw):
+    from tests.support.paper_exchange import PaperExchange
+    return PaperExchange(position=position, **kw)
+
+
 def test_repeated_rollback_triggers_send_one_emergency_order_set(store):
-    client = FakeExchange(ioc_fill=True)
-    e = _engine(store, client)
+    ex = _paper(0.5)
+    e = _engine(store, ex)
     r1 = e.trigger_emergency_rollback("BTCUSDT", "BUY", 0.5, 5e4)
     r2 = e.trigger_emergency_rollback("BTCUSDT", "BUY", 0.5, 5e4)
     r3 = e.trigger_emergency_rollback("BTCUSDT", "BUY", 0.5, 5e4)
     assert r1["status"] == "ROLLBACK_COMPLETED"
-    assert r2["status"] == r3["status"] == "ROLLBACK_DUPLICATE_SUPPRESSED"
-    assert [k for k, _ in client.sent] == ["ioc"]
+    assert r2["status"] == r3["status"] == "ROLLBACK_COMPLETED" and r2["no_position_to_close"] is True
+    assert [k for k, *_ in ex.sent] == ["ioc"]          # flat => no further order of any kind
     assert e.emergency_lock == EmergencyLockState.LOCKED
 
 
 def test_concurrent_rollbacks_send_one_emergency_order(store):
-    client = FakeExchange(ioc_fill=True)
-    e = _engine(store, client)
+    ex = _paper(0.5)
+    e = _engine(store, ex)
     barrier, out = threading.Barrier(8), []
 
     def work():
@@ -490,17 +497,20 @@ def test_concurrent_rollbacks_send_one_emergency_order(store):
     ts = [threading.Thread(target=work) for _ in range(8)]
     [t.start() for t in ts]
     [t.join() for t in ts]
-    assert out.count("ROLLBACK_COMPLETED") == 1 and len(client.sent) == 1
+    assert len(ex.sent) == 1                       # exactly one emergency order reached the exchange
+    assert set(out) <= {"ROLLBACK_COMPLETED", "ROLLBACK_DUPLICATE_SUPPRESSED", "ROLLBACK_INCOMPLETE_LOCKED"}
+    assert ex.positions["BTCUSDT"] == 0.0
 
 
 def test_emergency_unknown_blocks_second_liquidation_and_never_resends(store):
-    client = FakeExchange(fail=TimeoutError("lost"))
-    e = _engine(store, client)
+    ex = _paper(0.5)
+    ex.fail_sends = TimeoutError("lost")
+    e = _engine(store, ex)
     r1 = e.trigger_emergency_rollback("BTCUSDT", "BUY", 0.5, 5e4)
     assert r1["status"] == "ROLLBACK_INCOMPLETE_LOCKED" and r1["order_status"] == "SUBMISSION_UNKNOWN"
     r2 = e.trigger_emergency_rollback("BTCUSDT", "BUY", 0.5, 5e4)   # same episode
     assert r2["status"] == "ROLLBACK_DUPLICATE_SUPPRESSED"
-    assert len(client.sent) == 1                                     # no market fallback, no resend
+    assert len(ex.sent) == 1                                         # no market fallback, no resend
     assert e.emergency_lock == EmergencyLockState.LOCKED
 
 
@@ -516,10 +526,11 @@ def test_partial_unique_index_blocks_second_active_emergency_for_symbol(store):
 
 
 def test_emergency_rollback_ioc_unfilled_falls_back_to_single_market(store):
-    client = FakeExchange(ioc_fill=False)
-    e = _engine(store, client)
+    ex = _paper(0.5)
+    ex.ioc_fill_ratio = 0.0
+    e = _engine(store, ex)
     r = e.trigger_emergency_rollback("BTCUSDT", "BUY", 0.5, 5e4)
     assert r["status"] == "ROLLBACK_COMPLETED" and r["market_close_executed"] is True
-    assert [k for k, _ in client.sent] == ["ioc", "market"]
-    assert e.trigger_emergency_rollback("BTCUSDT", "BUY", 0.5, 5e4)["status"] == "ROLLBACK_DUPLICATE_SUPPRESSED"
-    assert len(client.sent) == 2
+    assert [k for k, *_ in ex.sent] == ["ioc", "market"]
+    e.trigger_emergency_rollback("BTCUSDT", "BUY", 0.5, 5e4)
+    assert len(ex.sent) == 2

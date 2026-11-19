@@ -17,7 +17,9 @@ from typing import Any, Callable, List, Optional
 
 import psycopg
 
-from src.orders.errors import ExchangeRejected, IllegalTransition, PersistenceFailed, StaleClaim
+from src.orders.errors import (
+    EntriesBlocked, ExchangeRejected, IllegalTransition, PersistenceFailed, StaleClaim,
+)
 from src.orders.pg_store import IntentState, OrderIntent, OrderStore
 
 ACCEPTED_STATUSES = {"NEW", "PARTIALLY_FILLED", "FILLED"}
@@ -52,12 +54,16 @@ class SafeSubmitter:
         self.sender = sender
         self.query = query
         self.ack_validator = ack_validator
+        # Test hook: runs right after the pre-send re-check, before the exchange call.
+        self._after_presend_check: Optional[Callable[[], None]] = None
 
     def submit(self, authorization_id: str) -> SubmissionResult:
         """Raises AuthorizationAlreadyConsumed / ActiveEmergencyOrderExists / PersistenceFailed
         BEFORE anything is sent."""
         try:
             intent = self.store.consume_persist_and_claim(authorization_id)
+        except EntriesBlocked:
+            raise
         except psycopg.Error as exc:
             raise PersistenceFailed(str(exc)) from exc
         return self._send_and_record(intent)
@@ -66,6 +72,8 @@ class SafeSubmitter:
         """Explicit submission of a recovered INTENT_PERSISTED intent (never UNKNOWN ones)."""
         try:
             intent = self.store.claim_for_submit(intent_id)
+        except EntriesBlocked:
+            raise
         except psycopg.Error as exc:
             raise PersistenceFailed(str(exc)) from exc
         return self._send_and_record(intent)
@@ -73,6 +81,24 @@ class SafeSubmitter:
     def _send_and_record(self, intent: OrderIntent) -> SubmissionResult:
         # --- no DB transaction / lock is held from here until the outcome is recorded ---
         resp: Any = None
+        # Pre-send re-check for ENTRY: MITIGATION ONLY. It narrows, but cannot close, the window
+        # between "authority committed" and "request on the wire" (no DB lock may be held across
+        # the API call). A block that commits after this point is NOT prevented.
+        if intent.purpose == "ENTRY":
+            try:
+                reason = self.store.entries_blocked()
+            except psycopg.Error as exc:
+                reason = f"gate state unreadable: {type(exc).__name__}"   # fail closed
+            if reason:
+                try:
+                    done = self.store.record_outcome(
+                        intent.intent_id, intent.claim_token, IntentState.REJECTED,
+                        last_error=f"aborted_before_send: {reason}", note="entry gate closed pre-send")
+                    return SubmissionResult(done, done.state, None)
+                except (StaleClaim, psycopg.Error):
+                    return SubmissionResult(intent, IntentState.SUBMISSION_UNKNOWN, None, recorded=False)
+        if self._after_presend_check is not None:
+            self._after_presend_check()
         try:
             resp = self.sender(intent)
             if self.ack_validator(resp, intent):

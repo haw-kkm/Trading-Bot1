@@ -31,10 +31,16 @@ from psycopg import errors as pgerr
 from psycopg.rows import dict_row
 
 from src.orders.errors import (
-    ActiveEmergencyOrderExists, AuthorizationAlreadyConsumed, IllegalTransition, StaleClaim,
+    ActiveEmergencyOrderExists, AuthorizationAlreadyConsumed, EntriesBlocked, IllegalTransition,
+    StaleClaim,
 )
 
 MIGRATIONS_DIR = pathlib.Path(__file__).parent / "migrations"
+
+# The entry gate (advisory lock + entry_control singleton) is GLOBAL to the database: the schema
+# has no account_id. Correct ONLY for a single trading account. Multi-account support needs an
+# account_id column, per-account lock keys and per-account isolation tests FIRST.
+SINGLE_ACCOUNT_ONLY = True
 
 
 class IntentState(str, Enum):
@@ -118,6 +124,31 @@ class OrderStore:
         if self._fault is not None:
             self._fault(point)
 
+    # ---- entry gate (SINGLE_ACCOUNT_ONLY: one global advisory lock key, see migration 002) ----
+    @staticmethod
+    def _gate_lock(c) -> None:
+        """Transaction-scoped advisory lock shared by: ->UNKNOWN, UNKNOWN->resolved, ENTRY claim,
+        freeze release. Auto-released at COMMIT/ROLLBACK. Bounded wait: if the lock cannot be
+        obtained (timeout/deadlock/DB error) the exception propagates => no order is submitted."""
+        c.execute("SET LOCAL lock_timeout = '3s'")
+        c.execute("SELECT track_a_entry_gate_lock()")
+
+    @staticmethod
+    def _entry_block_reason(c) -> Optional[str]:
+        """Fresh statements; authoritative only when called AFTER _gate_lock in the same tx."""
+        if c.execute("SELECT frozen FROM entry_control WHERE id=1").fetchone()["frozen"]:
+            return "entries frozen"
+        if c.execute("SELECT 1 FROM order_intents WHERE state='SUBMISSION_UNKNOWN' LIMIT 1").fetchone():
+            return "unresolved SUBMISSION_UNKNOWN"
+        return None
+
+    def _require_entry_gate_open(self, c) -> None:
+        self._gate_lock(c)
+        self._hit("entry_gate_locked")
+        reason = self._entry_block_reason(c)
+        if reason:
+            raise EntriesBlocked(reason)
+
     @staticmethod
     def _event(c, intent_id, frm, to, note):
         c.execute("INSERT INTO order_events(intent_id, from_state, to_state, note)"
@@ -175,20 +206,37 @@ class OrderStore:
         COMMITTED before this returns; the caller then calls the exchange with no DB
         transaction or lock held."""
         with self._tx() as c:
+            p = c.execute("SELECT purpose FROM authorizations WHERE authorization_id=%s",
+                          (authorization_id,)).fetchone()
+            if p is None:
+                raise AuthorizationAlreadyConsumed(authorization_id)
+            if p["purpose"] == "ENTRY":
+                # lock -> re-read -> decide -> consume/claim, all in this one transaction
+                self._require_entry_gate_open(c)
             row = self._consume_and_insert(c, authorization_id)
             return _intent(self._claim(c, row["intent_id"]))
 
     def claim_for_submit(self, intent_id: int) -> OrderIntent:
         """CAS INTENT_PERSISTED -> SUBMIT_PENDING (for recovered, provably-unsent intents)."""
         with self._tx() as c:
+            p = c.execute("SELECT purpose FROM order_intents WHERE intent_id=%s",
+                          (intent_id,)).fetchone()
+            if p is not None and p["purpose"] == "ENTRY":
+                self._require_entry_gate_open(c)
             return _intent(self._claim(c, intent_id))
 
     def _claim(self, c, intent_id: int) -> dict:
         token = uuid.uuid4().hex
-        row = c.execute(
-            "UPDATE order_intents SET state='SUBMIT_PENDING', claim_token=%s, claimed_at=now(),"
-            " updated_at=now() WHERE intent_id=%s AND state='INTENT_PERSISTED' RETURNING *",
-            (token, intent_id)).fetchone()
+        try:
+            with c.transaction():
+                row = c.execute(
+                    "UPDATE order_intents SET state='SUBMIT_PENDING', claim_token=%s, claimed_at=now(),"
+                    " updated_at=now() WHERE intent_id=%s AND state='INTENT_PERSISTED' RETURNING *",
+                    (token, intent_id)).fetchone()
+        except pgerr.CheckViolation as exc:  # DB trigger backstop for any non-Python caller path
+            if "ENTRY_GATE_CLOSED" in str(exc):
+                raise EntriesBlocked(str(exc)) from exc
+            raise
         if row is None:
             raise IllegalTransition(f"intent {intent_id} is not INTENT_PERSISTED (cannot claim)")
         self._event(c, intent_id, "INTENT_PERSISTED", "SUBMIT_PENDING", "submit authority acquired")
@@ -202,6 +250,8 @@ class OrderStore:
         if new not in ALLOWED_TRANSITIONS[IntentState.SUBMIT_PENDING]:
             raise IllegalTransition(f"SUBMIT_PENDING -> {new.value}")
         with self._tx() as c:
+            if new == IntentState.SUBMISSION_UNKNOWN:
+                self._gate_lock(c)   # serialize with ENTRY claims; the DB trigger sets the freeze
             row = c.execute(
                 "UPDATE order_intents SET state=%s, updated_at=now(),"
                 " exchange_order_id=COALESCE(%s, exchange_order_id), last_error=COALESCE(%s, last_error)"
@@ -220,6 +270,7 @@ class OrderStore:
         if not evidence:
             raise IllegalTransition("resolution requires evidence")
         with self._tx() as c:
+            self._gate_lock(c)       # serialize with ENTRY claims (does NOT lift the freeze)
             row = c.execute(
                 "UPDATE order_intents SET state=%s, resolution_evidence=%s, updated_at=now(),"
                 " exchange_order_id=COALESCE(%s, exchange_order_id)"
@@ -239,6 +290,7 @@ class OrderStore:
         The claim holder died or hung; the request may or may not have reached the exchange, so
         it is NEVER resent. Use a lease >= max API timeout when live processes share the DB."""
         with self._tx() as c:
+            self._gate_lock(c)
             rows = c.execute(
                 "UPDATE order_intents SET state='SUBMISSION_UNKNOWN', updated_at=now(),"
                 " last_error='claim_abandoned_or_process_died'"
@@ -248,6 +300,42 @@ class OrderStore:
                 self._event(c, r["intent_id"], "SUBMIT_PENDING", "SUBMISSION_UNKNOWN",
                             "recovered: claim holder gone; outcome unknown")
             return [_intent(r) for r in rows]
+
+    # ---- persistent entry freeze ----------------------------------------
+    def freeze_entries(self, reason: str) -> None:
+        with self._tx() as c:
+            self._gate_lock(c)
+            c.execute("UPDATE entry_control SET frozen=TRUE, reason=%s,"
+                      " frozen_at=COALESCE(frozen_at, now()) WHERE id=1", (reason,))
+
+    def release_entry_freeze(self) -> bool:
+        """Lift the freeze ONLY if no unresolved intent exists (re-checked by the DB under the
+        gate lock). Returns False if refused. Never called by resolve/reconcile paths."""
+        try:
+            with self._tx() as c:
+                self._gate_lock(c)
+                c.execute("UPDATE entry_control SET frozen=FALSE, reason=NULL, frozen_at=NULL"
+                          " WHERE id=1")
+            return True
+        except pgerr.CheckViolation as exc:
+            if "RELEASE_REFUSED" in str(exc):
+                return False
+            raise
+
+    def entries_frozen(self) -> bool:
+        with self._tx() as c:
+            return bool(c.execute("SELECT frozen FROM entry_control WHERE id=1").fetchone()["frozen"])
+
+    def entries_blocked(self) -> Optional[str]:
+        """Unlocked read: advisory pre-send check only (authoritative check is under the lock)."""
+        with self._tx() as c:
+            return self._entry_block_reason(c)
+
+    def has_unresolved_intents(self) -> bool:
+        with self._tx() as c:
+            return c.execute("SELECT 1 FROM order_intents WHERE state IN"
+                             " ('INTENT_PERSISTED','SUBMIT_PENDING','SUBMISSION_UNKNOWN') LIMIT 1"
+                             ).fetchone() is not None
 
     # ---- reads ----------------------------------------------------------
     def get(self, intent_id: int) -> OrderIntent:
