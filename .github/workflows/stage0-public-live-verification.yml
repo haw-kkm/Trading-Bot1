@@ -23,11 +23,17 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: Verify live public market data and record evidence
         run: |
-          python tools/stage0_live_verify.py \
-            --seconds 30 \
-            --timeout-seconds 150 \
-            --approve-toobit-public-readonly \
-            --output-dir stage0-live-evidence
+          set +e
+          python tools/stage0_live_verify.py             --seconds 30             --timeout-seconds 150             --approve-toobit-public-readonly             --output-dir stage0-live-evidence
+          code=$?
+          set -e
+          # 0 = all PASS, 1 = at least one FAIL (job fails), 2 = no FAIL but NOT_RUN/INCONCLUSIVE stages
+          # (e.g. Binance HTTP 451 from the GitHub runner region: reported, never bypassed, never PASS).
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::Not every stage PASSED (NOT_RUN/INCONCLUSIVE). See verification-report.json."
+            exit 0
+          fi
+          exit $code
       - name: Archive reproducible evidence even when verification fails
         if: always()
         uses: actions/upload-artifact@v4

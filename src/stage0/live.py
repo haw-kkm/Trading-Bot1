@@ -32,6 +32,11 @@ from .envelope import EnvelopeError, Source
 from .orderbook import BookState, LocalOrderBook
 from .symbols import binance_to_common, toobit_to_common
 
+# Event types that must be READY at the end of a collection for the run to count as healthy.
+CORE_TYPES = {Source.BINANCE_SPOT: ("TRADE", "BOOK_TICKER"),
+              Source.BINANCE_FUTURES: ("TRADE", "BOOK_TICKER", "MARK_PRICE"),
+              Source.TOOBIT_FUTURES: ("TRADE", "BOOK_TICKER", "MARK_PRICE")}
+
 EXIT_OK, EXIT_REFUSED, EXIT_STARTUP, EXIT_RECONNECT, EXIT_INTEGRITY, EXIT_UNHEALTHY = 0, 2, 3, 4, 5, 6
 
 
@@ -80,7 +85,7 @@ class WebsocketsConnection:                       # pragma: no cover - needs the
 
     async def connect(self, url: str):
         import websockets
-        self._ws = await websockets.connect(url, open_timeout=15, ping_interval=None, max_size=2 ** 22)
+        self._ws = await websockets.connect(url, open_timeout=15, close_timeout=2, ping_interval=None, max_size=2 ** 22)
 
     async def send(self, text: str):
         try:
@@ -136,6 +141,9 @@ class LiveRunner:
         self.network_calls = 0
         self.rest_failures: List[dict] = []
         self.rest_retries = 0
+        self.ws_counts: Counter = Counter()           # events that arrived over the WebSocket, by type
+        self.rest_counts: Counter = Counter()         # events that came from REST reference polls, by type
+        self.end_state: Optional[dict] = None         # gate state captured when collection ended (before close)
         self.last_msg_at: Optional[datetime] = None
         self.max_gap_s = 0.0
         self.started_at: Optional[datetime] = None
@@ -170,8 +178,11 @@ class LiveRunner:
                 if e.status == 429 or e.status == 418 or 500 <= e.status < 600:
                     kind, wait = "TRANSIENT", self._server_wait(e) if e.status in (429, 418) else None
                     last = (kind, e.status, f"HTTP {e.status}", wait)
-                else:        # 400/401/403(WAF)/404 ...: retrying the same request cannot help
-                    raise RestFailure(path, "PERMANENT", e.status, attempt, f"HTTP {e.status}")
+                else:        # 400/401/403(WAF)/404/451 ...: retrying the same request cannot help
+                    why = f"HTTP {e.status}"
+                    if e.status == 451:
+                        why += " (access restricted for legal/regional reasons; not retried, not bypassed)"
+                    raise RestFailure(path, "PERMANENT", e.status, attempt, why)
             except TransportError as e:
                 last = ("TRANSIENT", None, e.kind, None)
             except ResponseFormatError as e:
@@ -191,9 +202,18 @@ class LiveRunner:
     def _note(self, f: RestFailure):
         self.rest_failures.append(f.record())
 
-    def _ingest_all(self, envs):
+    def _ingest_all(self, envs, channel="rest"):
         for e in envs:
+            (self.ws_counts if channel == "ws" else self.rest_counts)[e.event_type.value] += 1
             self.c._ingest(e)
+
+    def _capture_end(self, src: Source, common: str):
+        """Gate state at the END OF DATA (before the socket close handshake, which can take seconds)."""
+        now = self.clock()
+        core = CORE_TYPES[src]
+        self.end_state = {"at": now.isoformat(), "core_types": list(core),
+                          "readiness": self.c.gate.status(src, common, now, types=core).value,
+                          "per_type": self.c.gate.explain(src, common, now)}
 
     # ------------------------------------------------------------------ required: clock
     async def sync_clock(self, src: Source):
@@ -224,7 +244,7 @@ class LiveRunner:
             return [("/api/v1/futures/fundingRate", {"symbol": symbol}, "FUNDING_RATE", lambda r: ts.parse_funding_rate(r, rx())),
                     ("/quote/v1/openInterest", {"symbol": symbol}, "OPEN_INTEREST", lambda r: ts.parse_open_interest(r, rx())),
                     ("/quote/v1/markPrice", {"symbol": symbol}, "MARK_PRICE", lambda r: ts.parse_mark_price(r, rx())),
-                    ("/quote/v1/index", {"symbol": symbol}, "INDEX_PRICE", lambda r: ts.parse_index_price(r, rx())),
+                    ("/quote/v1/index", {"symbol": toobit.index_symbol(symbol)}, "INDEX_PRICE", lambda r: ts.parse_index_price(r, rx())),
                     ("/api/v1/exchangeInfo", None, "CONTRACT_SPEC", lambda r: [e for e in ts.parse_contracts(r, rx())
                                                                               if e.exchange_symbol == symbol])]
         if src == Source.BINANCE_FUTURES:
@@ -233,7 +253,7 @@ class LiveRunner:
                     ("/fapi/v1/fundingRate", {"symbol": symbol, "limit": 1}, "FUNDING_RATE", lambda r: P.parse_funding_history(r, rx())),
                     ("/futures/data/globalLongShortAccountRatio", {"symbol": symbol, "period": "5m", "limit": 1},
                      "LONG_SHORT_RATIO", lambda r: P.parse_long_short_ratio(r, rx()))]
-        return [("/api/v3/ticker/price", {"symbol": symbol}, "TICKER", lambda r: [binance.SPOT.parse_price(r, rx())])]
+        return []          # spot has no slow reference data; a one-shot REST price would only go stale
 
     async def poll_reference(self, src: Source, symbol: str):
         """Optional reference data. A failure is isolated (the stream keeps running) but is registered with
@@ -298,7 +318,7 @@ class LiveRunner:
                     raw = await asyncio.wait_for(conn.recv(), timeout=self.idle_timeout_s)
                     self._tick()
                     try:
-                        self._ingest_all(P.parse(json.loads(raw), self.clock()))
+                        self._ingest_all(P.parse(json.loads(raw), self.clock()), "ws")
                     except (EnvelopeError, KeyError, ValueError, TypeError) as e:
                         self.c.rejected.append({"error": f"{type(e).__name__}: {e}"})
                     b = self.c.books.get((src, common)) if with_book else None
@@ -309,6 +329,7 @@ class LiveRunner:
                             raise ResyncExhausted(b.reason)
                         self._begin_sync(src, common)
                         await self._binance_snapshot(src, symbol)
+                self._capture_end(src, common)
             except RestFailure as f:                   # snapshot could not be fetched
                 self._note(f)
                 if f.kind == "PERMANENT":
@@ -370,9 +391,12 @@ class LiveRunner:
                         continue
                     self._tick()
                     try:
-                        self._ingest_all(toobit.parse_ws(json.loads(raw), self.clock()))
+                        self._ingest_all(toobit.parse_ws(json.loads(raw), self.clock()), "ws")
+                    except toobit.SubscriptionError as e:
+                        raise FatalDataError(str(e))          # a rejected subscription cannot be retried away
                     except (EnvelopeError, KeyError, ValueError, TypeError) as e:
                         self.c.rejected.append({"error": f"{type(e).__name__}: {e}"})
+                self._capture_end(src, common)
             except (WsClosed, asyncio.TimeoutError, OSError) as e:
                 attempt = await self._backoff_or_give_up(src, common, attempt, delays, str(e) or type(e).__name__)
             finally:
@@ -401,6 +425,9 @@ class LiveRunner:
             reasons.append(f"{n_bad} of {n_ev + n_bad} messages could not be parsed")
         if gap > stall_s:
             reasons.append(f"data stalled for {gap:.0f}s (> {stall_s:.0f}s)")
+        if self.end_state is not None and self.end_state["readiness"] != "READY":
+            core = {k: v for k, v in self.end_state["per_type"].items() if k in self.end_state["core_types"]}
+            reasons.append(f"core data types not READY at end of collection ({self.end_state['readiness']}): {core}")
         return (EXIT_UNHEALTHY if reasons else EXIT_OK), reasons
 
 
@@ -454,7 +481,7 @@ async def check_rest(rest: PublicRestClient, src: Source, symbol: str, now: Call
              ("/quote/v1/depth", {"symbol": symbol, "limit": 5}, "toobit:depth", lambda r: [toobit.parse_depth(symbol, r, rx)], "rest_depth"),
              ("/quote/v1/contract/ticker/bookTicker", {"symbol": symbol}, "toobit:bookTicker", lambda r: toobit.parse_book_ticker(r, rx), "rest_book_ticker"),
              ("/quote/v1/markPrice", {"symbol": symbol}, "toobit:markPrice", lambda r: toobit.parse_mark_price(r, rx), "rest_mark_price"),
-             ("/quote/v1/index", {"symbol": symbol}, "toobit:index", lambda r: toobit.parse_index_price(r, rx), "rest_index_price"),
+             ("/quote/v1/index", {"symbol": toobit.index_symbol(symbol)}, "toobit:index", lambda r: toobit.parse_index_price(r, rx), "rest_index_price"),
              ("/api/v1/futures/fundingRate", {"symbol": symbol}, "toobit:funding", lambda r: toobit.parse_funding_rate(r, rx), "rest_funding_rate"),
              ("/quote/v1/openInterest", {"symbol": symbol}, "toobit:oi", lambda r: toobit.parse_open_interest(r, rx), "rest_open_interest"),
              ("/api/v1/exchangeInfo", None, "toobit:exchangeInfo",
@@ -481,6 +508,8 @@ async def check_rest(rest: PublicRestClient, src: Source, symbol: str, now: Call
             raise
         except HttpError as e:
             row.update(http_status=e.status, reason=("rate limited" if e.status == 429 else
+                                                     "access restricted for legal/regional reasons (HTTP 451); not bypassed"
+                                                     if e.status == 451 else
                                                      "server error" if e.status >= 500 else "request rejected"))
             out.append(row)
             continue
@@ -600,8 +629,11 @@ def main(argv=None) -> int:
                       "envelopes": len(col.envelopes), "rejected": len(col.rejected),
                       "issues": dict(Counter(col.gate.kinds())), "reconnects": runner.reconnects,
                       "resyncs": runner.resyncs, "rest_retries": runner.rest_retries,
+                      "ws_events_by_type": dict(runner.ws_counts), "rest_events_by_type": dict(runner.rest_counts),
+                      "rejected_by_error": dict(Counter(r["error"][:120] for r in col.rejected)),
+                      "end_of_collection": runner.end_state,
                       "rest_failures": runner.rest_failures, "max_gap_s": round(runner.max_gap_s, 1),
-                      "final_per_type": col.gate.explain(src, common, runner.clock())}, indent=2))
+                      }, indent=2))
     if err:
         print(f"FAILED: {err}", file=sys.stderr)
     elif reasons:
