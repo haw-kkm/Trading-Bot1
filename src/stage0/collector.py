@@ -36,11 +36,14 @@ class NetworkDisabled(RuntimeError):
 class NetworkPolicy:
     allow_binance: bool = False
     allow_toobit: bool = False
+    # Set ONLY from the explicit run-time flag --i-approve-toobit-public-readonly typed by the user
+    # (see live.py). Code/config/tests must never set it; TOOBIT_NETWORK_APPROVED stays False.
+    toobit_user_approved: bool = False
 
     def check(self, source: Source) -> None:
         if source == Source.TOOBIT_FUTURES:
-            if not (self.allow_toobit and TOOBIT_NETWORK_APPROVED):
-                raise NetworkDisabled("Toobit network access is disabled (not approved)")
+            if not (self.allow_toobit and (TOOBIT_NETWORK_APPROVED or self.toobit_user_approved)):
+                raise NetworkDisabled("Toobit network access is disabled (needs the user's run-time approval)")
         elif not self.allow_binance:
             raise NetworkDisabled("Binance network access is disabled (no explicit allow flag)")
 
@@ -51,9 +54,19 @@ PUBLIC_PATHS = {
     Source.BINANCE_FUTURES: {"/fapi/v1/time", "/fapi/v1/ticker/price", "/fapi/v1/depth", "/fapi/v1/klines",
                              "/fapi/v1/premiumIndex", "/fapi/v1/openInterest", "/fapi/v1/fundingRate",
                              "/futures/data/globalLongShortAccountRatio", "/fapi/v1/exchangeInfo"},
-    Source.TOOBIT_FUTURES: set(),    # unverified: no path is allow-listed
+    # Toobit public market-data paths from https://api-docs.toobit.com (read 2026-11-20). GET only.
+    Source.TOOBIT_FUTURES: {"/api/v1/time", "/api/v1/exchangeInfo", "/quote/v1/depth", "/quote/v1/trades",
+                            "/quote/v1/contract/ticker/price", "/quote/v1/contract/ticker/bookTicker",
+                            "/quote/v1/markPrice", "/quote/v1/index", "/api/v1/futures/fundingRate",
+                            "/quote/v1/openInterest", "/quote/v1/klines"},
 }
-HOSTS = {Source.BINANCE_SPOT: "https://api.binance.com", Source.BINANCE_FUTURES: "https://fapi.binance.com"}
+# Toobit REST host is NOT stated on the docs pages read; https://api.toobit.com comes from ccxt's
+# toobit definition (secondary source) -> confirm with the --check run.
+HOSTS = {Source.BINANCE_SPOT: "https://api.binance.com", Source.BINANCE_FUTURES: "https://fapi.binance.com",
+         Source.TOOBIT_FUTURES: "https://api.toobit.com"}
+WS_URLS = {Source.BINANCE_SPOT: "wss://stream.binance.com:9443/stream",
+           Source.BINANCE_FUTURES: "wss://fstream.binance.com/stream",
+           Source.TOOBIT_FUTURES: "wss://stream.toobit.com/quote/ws/v1"}
 _FORBIDDEN_PARAMS = {"signature", "apikey", "api_key", "timestamp_sig", "recvwindow"}
 
 
@@ -179,11 +192,13 @@ class Collector:
             p = {"ticker": lambda: toobit.parse_ticker_price(msg, rx),
                  "trades": lambda: toobit.parse_trades(rec["symbol"], msg, rx),
                  "depth": lambda: [toobit.parse_depth(rec["symbol"], msg, rx)],
-                 "mark_price": lambda: [toobit.parse_mark_price(msg, rx)],
-                 "index_price": lambda: [toobit.parse_index_price(msg, rx)],
-                 "funding_rate": lambda: [toobit.parse_funding_rate(msg, rx)],
-                 "open_interest": lambda: [toobit.parse_open_interest(msg, rx)],
-                 "contract": lambda: [toobit.parse_contract(msg, rx)]}
+                 "book_ticker": lambda: toobit.parse_book_ticker(msg, rx),
+                 "mark_price": lambda: toobit.parse_mark_price(msg, rx),
+                 "index_price": lambda: toobit.parse_index_price(msg, rx),
+                 "funding_rate": lambda: toobit.parse_funding_rate(msg, rx),
+                 "open_interest": lambda: toobit.parse_open_interest(msg, rx),
+                 "contract": lambda: toobit.parse_contracts(msg, rx),
+                 "ws": lambda: toobit.parse_ws(msg, rx)}
         else:
             P = binance.FUTURES if src == Source.BINANCE_FUTURES else binance.SPOT
             p = {"ws": lambda: P.parse(msg, rx),
