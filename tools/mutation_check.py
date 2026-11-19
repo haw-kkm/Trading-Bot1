@@ -54,7 +54,8 @@ def run_pytest(tests, env, log_path):
         p = subprocess.run(cmd, cwd=ROOT, env=env, stdout=fh, stderr=subprocess.STDOUT)
     text = pathlib.Path(log_path).read_text(encoding="utf-8", errors="replace")
     failed = re.findall(r"^FAILED (\S+)", text, re.M)
-    return p.returncode, failed, text.strip().splitlines()[-1] if text.strip() else ""
+    errors = re.findall(r"^ERROR (\S+)", text, re.M)       # collection / fixture / setup errors
+    return p.returncode, failed, errors, text.strip().splitlines()[-1] if text.strip() else ""
 
 
 def fresh_db_env(base_env, name):
@@ -88,7 +89,7 @@ def main() -> int:
 
     all_tests = sorted({t for m in MUTATIONS for t in m[4]})
     env, _ = fresh_db_env(dict(os.environ), "baseline")
-    rc, failed, last = run_pytest(all_tests, env, out / "baseline.log")
+    rc, failed, errors, last = run_pytest(all_tests, env, out / "baseline.log")
     report["baseline"] = {"returncode": rc, "summary": last, "tests": all_tests}
     if rc != 0:
         ok = False
@@ -110,12 +111,23 @@ def main() -> int:
                     f"--- {fname}\nPATTERN: {pattern}\nREPLACED WITH: {repl}\n", encoding="utf-8")
                 env, dbname = fresh_db_env(dict(os.environ), name)
                 env["TRACK_A_MIGRATIONS_DIR"] = str(tmp / "migrations")
-                rc, failed, last = run_pytest(tests, env, out / f"{name}.log")
-                killed = rc != 0
+                rc, failed, errors, last = run_pytest(tests, env, out / f"{name}.log")
+                # KILLED only if pytest ran and reported genuine TEST FAILURES (exit code 1, FAILED
+                # lines, no ERROR lines). Collection errors (rc 2), infrastructure crashes, a
+                # missing DB, import errors etc. are INCONCLUSIVE and fail the check.
+                killed = rc == 1 and bool(failed) and not errors
+                if not killed and rc != 0:
+                    ok = False
+                    report["mutations"].append({
+                        "name": name, "status": "INCONCLUSIVE_ENVIRONMENT_OR_COLLECTION_ERROR",
+                        "returncode": rc, "errors": errors[:20], "summary": last})
+                    continue
                 ok &= killed
                 report["mutations"].append({
                     "name": name, "migration": fname, "tests": tests,
                     "status": "KILLED" if killed else "SURVIVED", "returncode": rc,
+                    "applied": True, "original_sha256": __import__("hashlib").sha256(src.encode()).hexdigest(),
+                    "mutated_sha256": __import__("hashlib").sha256(mutated.encode()).hexdigest(),
                     "failing_tests": failed[:20], "summary": last, "database": dbname})
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)

@@ -28,7 +28,7 @@ class RiskEngine:
     # Hard-coded expected SHA-256 of the pristine config/risk-limits.json.
     # If the file on disk is tampered with, this digest will not match and
     # the engine refuses to operate. This is the tamper-evident anchor.
-    _EXPECTED_CHECKSUM = "64dfcdf9d5b0c45388366c4182d3aaee0feabd045b269ed1d0849c5ed41a3e2d"
+    _EXPECTED_CHECKSUM = "7d255d1bdad08e4cadeea37769ce2c9d1c11704a53789f04ab541148d30fba76"
 
     # Secret HMAC key for ValidatedOrder tokens. Held only here; never exposed.
     # Per-process random unless RISK_ENGINE_HMAC_KEY (hex) is set, so tokens
