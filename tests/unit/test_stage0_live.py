@@ -263,7 +263,7 @@ def test_toobit_blocked_without_user_approval_even_if_allow_flag_set():
 
 
 def test_toobit_subscribes_parses_pings_and_gates():
-    script = [tws("trade", [{"v": "1", "t": MS, "p": "100", "q": "2", "m": True}]),
+    script = [tws("trade", [{"v": "1", "t": MS, "p": "100", "q": "2", "m": True}], f=False),
               tws("bookTicker", {"e": "bookTicker", "E": MS, "s": TSYM, "b": "99", "bq": "1", "a": "100", "aq": "1", "t": MS}),
               "TIMEOUT1", {"pong": 1}, tws("markPrice", [{"symbol": TSYM, "markPrice": "100", "time": MS}])]
     r, c, fac, rest, clock = make([script], {}, policy=APPROVED, ping_interval_s=10)

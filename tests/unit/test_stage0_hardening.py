@@ -2,6 +2,7 @@
 credential isolation. Fake transports only; no real network."""
 import asyncio
 import json
+from collections import Counter
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -276,7 +277,7 @@ def test_full_run_survives_optional_failure_but_fails_closed_on_required_one():
     clock = Clock()
     late = MS + 35_000          # REST back-off consumed ~35 s of the fake clock before streaming began
     fac = Factory([[tws("bookTicker", {"e": "bookTicker", "E": late, "s": TSYM, "b": "99", "bq": "1", "a": "100", "aq": "1", "t": late}),
-                    tws("trade", [{"v": "1", "t": late, "p": "100", "q": "1", "m": True}])]], clock)
+                    tws("trade", [{"v": "1", "t": late, "p": "100", "q": "1", "m": True}], f=False)]], clock)
     c = Collector()
     r = LiveRunner(c, PublicRestClient(APPROVED, transport=FakeRest(resp)), PublicWsClient(APPROVED, fac), clock=clock,
                    sleep=_Sleeper(clock), rest_policy=RestPolicy(jitter=lambda d: 0.0))
@@ -317,6 +318,7 @@ class StubRunner:
 
     def __init__(self, c, rest, ws):
         self.c, self.reconnects, self.resyncs, self.rest_retries, self.rest_failures, self.max_gap_s = c, 0, 0, 0, [], 0.0
+        self.ws_counts, self.rest_counts, self.end_state = Counter(), Counter(), None
 
     def clock(self):
         return T0

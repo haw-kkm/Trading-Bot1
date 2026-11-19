@@ -29,6 +29,7 @@ def test_rest_mark_price_uses_symbolId_and_price_object_or_list():
 
 
 def test_rest_index_is_a_symbol_keyed_map_and_unverified():
+    assert toobit.parse_index_price({"index": {}, "edp": {}}, RX) == []      # empty map: no events (not a crash)
     [e] = toobit.parse_index_price({"index": {"BTCUSDT": "50008.1"}, "edp": {"BTCUSDT": "50007.9"}}, RX)
     assert e.normalized_payload["index_price"] == Decimal("50008.1") and e.normalized_payload["edp_10m_avg"] == Decimal("50007.9")
     assert e.symbol == "BTC/USDT:USDT" and "UNVERIFIED_SCHEMA" in e.quality_flags
@@ -131,8 +132,8 @@ def test_ws_ping_pong_ignored_unknown_topic_rejected():
 def test_ws_and_rest_shapes_are_not_interchangeable():
     with pytest.raises(EnvelopeError):
         toobit.parse_mark_price({"symbol": SYM, "markPrice": "1", "time": MS}, RX)     # WS item given to REST parser
-    with pytest.raises(EnvelopeError):
-        toobit.parse_ws(ws("markPrice", [{"symbolId": SYM, "price": "1", "time": MS}]), RX)  # REST item given to WS parser
+    # LIVE-OBSERVED (2026-11-19): the WS markPrice push really uses the REST-like item, so the WS parser accepts both
+    assert len(toobit.parse_ws(ws("markPrice", [{"symbolId": SYM, "price": "1", "time": MS}]), RX)) == 1
 
 
 def test_subscribe_message_matches_docs():
