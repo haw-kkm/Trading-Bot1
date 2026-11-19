@@ -10,9 +10,11 @@ Every stage gets exactly one status:
   INCONCLUSIVE  attempted, no failure, but the evidence cannot establish success (empty data, docs leave the
                 meaning open, a small share of unparsable messages)
   NOT_RUN       could not be attempted (e.g. required REST startup data unavailable)
+A source whose REST requests ALL returned HTTP 451 is marked environment_blocked: its status stays FAIL/NOT_RUN
+(never PASS), but it does not turn the exit code into 1 (the code is not at fault; the network location is).
 Per source the stages are: rest | ws_received | ws_parsed | ws_fresh | gate_ready; the source status is the
-worst of them (FAIL > NOT_RUN > INCONCLUSIVE > PASS). Exit code: 0 all PASS, 1 any FAIL, 2 no FAIL but some
-NOT_RUN/INCONCLUSIVE.
+worst of them (FAIL > NOT_RUN > INCONCLUSIVE > PASS). Exit code: 0 all PASS, 1 any FAIL (excluding
+environment-blocked sources), 2 no such FAIL but some FAIL/NOT_RUN/INCONCLUSIVE remains.
 """
 from __future__ import annotations
 
@@ -170,7 +172,9 @@ def verify(source: str, logdir: Path, seconds: int, timeout: int):
     evidence = file_evidence(output)
     stages = {"rest": {"status": rest_status, "reason": rest_reason, "endpoints": rows}}
     stages.update(judge_ws(collect, summary, required, evidence, 20.0))
-    return {"source": source, "symbol": symbol,
+    blocked = bool(rows) and all(isinstance(r, dict) and r.get("http_status") == 451 for r in rows)
+    return {"source": source, "symbol": symbol, "environment_blocked": blocked,
+            "blocked_reason": "all REST requests returned HTTP 451 (restricted region/legal; not bypassed)" if blocked else None,
             "status": worst([s["status"] for s in stages.values()]),
             "stages": stages, "rest_check_run": check, "collection_run": collect,
             "collection_summary": summary, "events_file": evidence, "required_ws_types": list(required),
@@ -185,6 +189,7 @@ def main(argv=None):
     p.add_argument("--approve-toobit-public-readonly", action="store_true",
                    help="explicitly approve unauthenticated Toobit public market data GET/WS")
     p.add_argument("--binance-only", action="store_true")
+    p.add_argument("--github-annotations", action="store_true", help="also print ::notice:: lines (CI summary)")
     p.add_argument("--sources", nargs="*", choices=list(SOURCES), help="restrict to these sources")
     args = p.parse_args(argv)
     if not 15 <= args.seconds <= 120:
@@ -206,7 +211,22 @@ def main(argv=None):
         line = ", ".join(f"{k}={v['status']}" for k, v in r["stages"].items())
         print(f"{r['source']}: {r['status']} ({line})")
     print(f"Overall: {overall}; evidence: {target}")
-    return {PASS: 0, INCONCLUSIVE: 2, NOT_RUN: 2, FAIL: 1}[overall]
+    if args.github_annotations:
+        for r in records:
+            line = ", ".join(f"{k}={v['status']}" for k, v in r["stages"].items())
+            blocked = " [environment_blocked: HTTP 451]" if r.get("environment_blocked") else ""
+            print(f"::notice title=stage0 {r['source']}::{r['status']}{blocked} ({line})")
+            for k, v in r["stages"].items():
+                if v["status"] != PASS and k != "rest":
+                    print(f"::notice title=stage0 {r['source']} {k}::{v['status']}: {str(v.get('reason'))[:200]}")
+            rest = r["stages"]["rest"]
+            for e in rest.get("endpoints", []):
+                if isinstance(e, dict) and e.get("verdict") != PASS:
+                    print(f"::notice title=stage0 {r['source']} REST {e.get('endpoint')}::{e.get('verdict')} http={e.get('http_status')} {str(e.get('reason'))[:160]}")
+    counted = [r for r in records if not r.get("environment_blocked")]
+    if any(r["status"] == FAIL for r in counted):
+        return 1
+    return 0 if overall == PASS else 2
 
 
 if __name__ == "__main__":

@@ -281,6 +281,11 @@ def test_tool_main_exit_codes_and_report(tmp_path, monkeypatch):
     assert rep["overall"] == "NOT_RUN" and rep["trading_or_account_requests"] is False
     monkeypatch.setattr(t, "verify", lambda *a: {"source": "x", "status": "FAIL", "stages": {"rest": {"status": "FAIL"}}})
     assert t.main(["--output-dir", str(tmp_path), "--binance-only"]) == 1
+    # a source blocked only by HTTP 451 stays FAIL in the report but does not make the exit code 1
+    monkeypatch.setattr(t, "verify", lambda *a: {"source": "x", "status": "FAIL", "environment_blocked": True,
+                                                  "stages": {"rest": {"status": "FAIL"}}})
+    assert t.main(["--output-dir", str(tmp_path), "--binance-only"]) == 2
+    assert json.loads((tmp_path / "verification-report.json").read_text())["overall"] == "FAIL"
     monkeypatch.setattr(t, "verify", lambda *a: {"source": "x", "status": "PASS", "stages": {"rest": {"status": "PASS"}}})
     assert t.main(["--output-dir", str(tmp_path), "--binance-only"]) == 0
     with pytest.raises(SystemExit):
