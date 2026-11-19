@@ -172,6 +172,31 @@ class ExecutionEngine:
                 "execution refused: missing or invalid ValidatedOrder token"
             )
 
+    @staticmethod
+    def _same(a: Optional[float], b: Optional[float]) -> bool:
+        if a is None or b is None:
+            return a is b
+        return abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(b)))
+
+    @classmethod
+    def _bind(cls, vo: ValidatedOrder, symbol: str, side: str, *, price: Any = "skip",
+              stop_loss: Any = "skip", take_profit: Any = "skip") -> None:
+        """P0-1: the caller's order parameters must equal the values the token signed.
+        A valid token for BTC/BUY must not authorize ETH/SELL or a different price."""
+        bad = []
+        if symbol != vo.symbol:
+            bad.append(f"symbol {symbol!r} != signed {vo.symbol!r}")
+        if side != vo.side:
+            bad.append(f"side {side!r} != signed {vo.side!r}")
+        if price != "skip" and not cls._same(price, vo.price):
+            bad.append(f"price {price!r} != signed {vo.price!r}")
+        if stop_loss != "skip" and not cls._same(stop_loss, vo.stop_loss):
+            bad.append(f"stop_loss {stop_loss!r} != signed {vo.stop_loss!r}")
+        if take_profit != "skip" and not cls._same(take_profit, vo.take_profit):
+            bad.append(f"take_profit {take_profit!r} != signed {vo.take_profit!r}")
+        if bad:
+            raise UnauthorizedExecutionError("execution refused: order differs from token: " + "; ".join(bad))
+
     # ------------------------------------------------------------------
     # Order submission. ExecutionEngine owns ONLY the exchange API calls
     # (_exchange_send/_exchange_query). Persistence, one-time authorization,
@@ -274,6 +299,7 @@ class ExecutionEngine:
     ) -> Dict[str, Any]:
         """Reduce-only (EXIT) order. Allowed during emergency lock (risk reduction)."""
         self._require_token(validated_order)
+        self._bind(validated_order, symbol, side, price=price)
         quantity = validated_order.quantity  # clamped quantity is authoritative
         out = self._submit_order(OrderPurpose.EXIT, "LIMIT", symbol, side, quantity, price,
                                  self._auth_id(validated_order), True)
@@ -291,6 +317,7 @@ class ExecutionEngine:
     ) -> Dict[str, Any]:
         """IOC (ENTRY purpose). Refused during emergency lock / entry freeze."""
         self._require_token(validated_order)
+        self._bind(validated_order, symbol, side, price=price)
         quantity = validated_order.quantity
         out = self._submit_order(OrderPurpose.ENTRY, "IOC", symbol, side, quantity, price,
                                  self._auth_id(validated_order), True)
@@ -309,6 +336,7 @@ class ExecutionEngine:
 
         An API timeout / lost response is SUBMISSION_UNKNOWN: no rollback, no resend."""
         self._require_token(validated_order)
+        self._bind(validated_order, symbol, side)
         quantity = validated_order.quantity
         out = self._submit_order(OrderPurpose.ENTRY, "MARKET", symbol, side, quantity,
                                  validated_order.price, self._auth_id(validated_order), True)
@@ -332,7 +360,8 @@ class ExecutionEngine:
             symbol: Trading symbol
             side: Order side (BUY/SELL)
             quantity: Order quantity
-            price: Fill price
+            price: Fill price (informational: it legitimately differs from the approved
+                price, so it is NOT compared against the token)
             stop_loss: Stop loss price
             take_profit: Take profit price
             validated_order: ValidatedOrder token issued by RiskEngine.
@@ -342,7 +371,17 @@ class ExecutionEngine:
             Dict with registration result
         """
         self._require_token(validated_order)
-        quantity = validated_order.quantity  # clamped quantity is authoritative
+        self._bind(validated_order, symbol, side, stop_loss=stop_loss, take_profit=take_profit)
+        # P0-1: protection quantity = the ACTUAL cumulative filled quantity supplied by the
+        # caller, never overwritten by the approved quantity. Protection is reduce-side, so it
+        # cannot add exposure; an over-fill (filled > approved) must still be protected, and is
+        # alerted rather than rejected (rejecting would leave a real position unprotected).
+        if not isinstance(quantity, (int, float)) or isinstance(quantity, bool) or quantity <= 0:
+            raise UnauthorizedExecutionError(f"execution refused: invalid protection quantity {quantity!r}")
+        if quantity > validated_order.quantity * (1 + 1e-9):
+            self.alert_sink.alert(
+                "ERROR", f"filled {quantity} exceeds approved {validated_order.quantity} for "
+                f"{symbol}; protecting the actual filled quantity", "ExecutionEngine")
 
         try:
             result = self.toobit_client.register_sl_tp(symbol, side, quantity, price, stop_loss, take_profit)
