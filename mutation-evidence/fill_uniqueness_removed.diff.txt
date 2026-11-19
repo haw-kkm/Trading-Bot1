@@ -1,3 +1,0 @@
---- 004_order_lifecycle_fills.sql
-PATTERN: CONSTRAINT uq_fill_once UNIQUE \(intent_id, exchange_fill_id\)
-REPLACED WITH: CONSTRAINT uq_fill_once CHECK (true)

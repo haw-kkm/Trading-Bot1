@@ -1,3 +1,0 @@
---- 004_order_lifecycle_fills.sql
-PATTERN: IF NEW\.filled_qty < OLD\.filled_qty THEN
-REPLACED WITH: IF FALSE THEN

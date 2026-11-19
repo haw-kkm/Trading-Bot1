@@ -1,3 +1,0 @@
---- 002_entry_gate.sql
-PATTERN: SELECT pg_advisory_xact_lock\(hashtext\('track_a_entry_gate'\)\);
-REPLACED WITH: SELECT 1;
