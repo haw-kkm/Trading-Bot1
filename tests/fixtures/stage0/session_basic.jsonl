@@ -1,0 +1,16 @@
+# Deterministic replay. Binance records follow Binance's public message shapes (not re-verified live).
+# Toobit records are SYNTHETIC / UNVERIFIED (not official samples).
+{"t":"2026-03-31T12:00:00Z","source":"binance-spot","kind":"control","action":"connect","symbol":"BTCUSDT"}
+{"t":"2026-03-31T12:00:00Z","source":"binance-spot","kind":"control","action":"start_sync","symbol":"BTCUSDT"}
+{"t":"2026-03-31T12:00:00.100Z","source":"binance-spot","kind":"ws","msg":{"e":"depthUpdate","E":1774958400050,"s":"BTCUSDT","U":99,"u":101,"b":[["50000.00","1.0"]],"a":[["50001.00","2.0"]]}}
+{"t":"2026-03-31T12:00:00.200Z","source":"binance-spot","kind":"depth_snapshot","symbol":"BTCUSDT","msg":{"lastUpdateId":100,"bids":[["49999.00","3.0"]],"asks":[["50002.00","1.5"]]}}
+{"t":"2026-03-31T12:00:00.300Z","source":"binance-spot","kind":"ws","msg":{"e":"depthUpdate","E":1774958400250,"s":"BTCUSDT","U":102,"u":103,"b":[["50000.00","2.0"]],"a":[]}}
+{"t":"2026-03-31T12:00:00.400Z","source":"binance-spot","kind":"ws","msg":{"e":"trade","E":1774958400350,"s":"BTCUSDT","t":555,"p":"50000.50","q":"0.01","T":1774958400349,"m":false}}
+{"t":"2026-03-31T12:00:00.500Z","source":"binance-spot","kind":"ws","msg":{"u":7,"s":"BTCUSDT","b":"50000.00","B":"2.0","a":"50001.00","A":"2.0"}}
+{"t":"2026-03-31T12:00:01Z","source":"binance-futures","kind":"control","action":"connect","symbol":"BTCUSDT"}
+{"t":"2026-03-31T12:00:01Z","source":"binance-futures","kind":"ws","msg":{"e":"markPriceUpdate","E":1774958400900,"s":"BTCUSDT","p":"50010.1","i":"50008.2","P":"50009","r":"0.0001","T":1774972800000}}
+{"t":"2026-03-31T12:00:01.100Z","source":"binance-futures","kind":"open_interest","msg":{"symbol":"BTCUSDT","openInterest":"1234.5","time":1774958401000}}
+{"t":"2026-03-31T12:00:01.200Z","source":"binance-futures","kind":"ws","msg":{"e":"forceOrder","E":1774958401100,"o":{"s":"BTCUSDT","S":"SELL","o":"LIMIT","f":"IOC","q":"0.5","p":"49900","ap":"49905","X":"FILLED","l":"0.5","z":"0.5","T":1774958401099}}}
+{"t":"2026-03-31T12:00:01.300Z","source":"toobit-futures","kind":"ticker","msg":[{"s":"BTC-SWAP-USDT","p":"50003.0"}]}
+{"t":"2026-03-31T12:00:01.400Z","source":"toobit-futures","kind":"trades","symbol":"BTC-SWAP-USDT","msg":[{"t":1774958401300,"p":"50003.5","q":"3","ibm":true}]}
+{"t":"2026-03-31T12:00:01.500Z","source":"binance-spot","kind":"ws","msg":{"e":"bogus"}}
