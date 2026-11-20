@@ -60,7 +60,8 @@ class EnvelopeError(ValueError):
 
 # Any of these makes an event UNVERIFIED for the quality gate (never READY, never compared across exchanges):
 # schema not verified, or a semantic link (contract->index mapping, quantity unit) not officially confirmed.
-UNVERIFIED_FLAGS = frozenset({"UNVERIFIED_SCHEMA", "UNVERIFIED_CONTRACT_MAPPING", "UNVERIFIED_UNIT"})
+UNVERIFIED_FLAGS = frozenset({"UNVERIFIED_SCHEMA", "UNVERIFIED_CONTRACT_MAPPING", "UNVERIFIED_UNIT",
+                              "UNVERIFIED_AGGREGATION"})
 PENALTY_FLAGS = frozenset({"FUTURE_EVENT_TIME", "NO_EVENT_TIME", "CROSSED_BOOK"}) | UNVERIFIED_FLAGS
 _BASE = {Provenance.OBSERVED: 1.0, Provenance.DERIVED: 0.8, Provenance.ESTIMATED: 0.5}
 

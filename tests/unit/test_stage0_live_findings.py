@@ -42,11 +42,13 @@ def obs_trade(first: bool, ts, base_id=4900197869811334542):
 
 
 # ===================================================================== Toobit index symbol
-def test_index_symbol_form_and_ws_subscribe_uses_it():
+def test_legacy_index_symbol_helper_and_ws_subscribe_take_the_index_token():
     assert toobit.index_symbol(TSYM) == "BTCUSDT" and toobit.index_symbol("ETH-SWAP-USDT") == "ETHUSDT"
     with pytest.raises(EnvelopeError):
         toobit.index_symbol("BTCUSDT")
-    assert toobit.ws_subscribe_message("index", TSYM)["symbol"] == "BTCUSDT"
+    assert toobit.ws_subscribe_message("index", "BTCUSDT")["symbol"] == "BTCUSDT"      # caller passes the indexToken
+    with pytest.raises(EnvelopeError):
+        toobit.ws_subscribe_message("index", TSYM)                                   # never derived from the contract symbol
     assert toobit.ws_subscribe_message("trade", TSYM)["symbol"] == TSYM
 
 
@@ -68,19 +70,22 @@ def _toobit_check(resp):
     return {r["endpoint"]: r for r in rows}, seen
 
 
-def test_check_requests_index_with_index_symbol_and_empty_map_is_inconclusive():
+def test_check_requests_index_with_the_index_token_and_empty_map_is_inconclusive():
     from tests.unit.test_stage0_hardening import GOOD_TB
     resp = dict(GOOD_TB)
     resp["/quote/v1/index"] = {"index": {}, "edp": {}}
+    resp["/api/v1/exchangeInfo"] = {"contracts": [dict(GOOD_TB["/api/v1/exchangeInfo"]["contracts"][0], indexToken="BTCUSDT")]}
     rep, seen = _toobit_check(resp)
     assert ("/quote/v1/index", {"symbol": "BTCUSDT"}) in seen
     assert rep["/quote/v1/index"]["verdict"] == "INCONCLUSIVE" and rep["/quote/v1/index"]["parsed_events"] == 0
 
 
-def test_poll_reference_uses_index_symbol_and_flags_missing_index():
+def test_poll_reference_uses_the_index_token_and_flags_missing_index():
     resp = {"/api/v1/futures/fundingRate": [], "/quote/v1/openInterest": {"openInterestList": []},
             "/quote/v1/markPrice": {"exchangeId": 301, "symbolId": TSYM, "price": "1", "time": MS},
-            "/quote/v1/index": {"index": {}, "edp": {}}, "/api/v1/exchangeInfo": {"contracts": []}}
+            "/quote/v1/index": {"index": {}, "edp": {}},
+            "/api/v1/exchangeInfo": {"contracts": [{"symbol": TSYM, "contractMultiplier": "0.001", "filters": [],
+                                                    "indexToken": "BTCUSDT"}]}}
     r, c, fr, clock = make_rest(resp, pol=APPROVED)
     run(r.poll_reference(TB, TSYM))
     assert ("/quote/v1/index", {"symbol": "BTCUSDT"}) in fr.calls

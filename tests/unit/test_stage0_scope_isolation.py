@@ -1,10 +1,12 @@
 """Stage 0 scope split (core_collection vs extended_semantics) and isolation of unverified Toobit data.
 
-Facts these tests encode (2026-11-20; official docs https://api-docs.toobit.com/api/usdt-m-market-data.html + live
-public GETs): the contract->index mapping and the open-interest unit / multiplier / aggregation are NOT officially
-confirmed. So:
-  * INDEX_PRICE / OPEN_INTEREST envelopes carry isolation flags and are never READY / never compared across exchanges;
-  * open interest never gets a definite unit, is never rescaled, never comparable across exchanges;
+Facts these tests encode (official docs https://api-docs.toobit.com/api/usdt-m-market-data.html, live public GETs and
+Toobit Support ticket #20261120000097, reply 2026-11-20 15:56:04): the contract->index rule is exchangeInfo indexToken,
+the open-interest size is a BASE_ASSET quantity with the contract coefficient already applied; the open-interest
+AGGREGATION basis (and the WebSocket index symbol) are NOT officially confirmed. So:
+  * an INDEX_PRICE envelope is isolated unless the caller proves the contract's indexToken; OPEN_INTEREST envelopes
+    stay isolated (never READY / never compared across exchanges) while the aggregation basis is open;
+  * open interest is never rescaled by contractMultiplier and never comparable across exchanges;
   * only a well-formed OFFICIAL evidence record (plus the VERIFICATION edit) can lift that - never VERIFICATION alone;
   * the full `overall` / exit code are unchanged (Toobit stays INCONCLUSIVE, exit 2); core_collection may PASS only
     because core never uses those two types, and the exclusion is reported with its status and reason."""
@@ -41,43 +43,59 @@ def oi_env(size="39449.36077"):
 
 
 def idx_env():
+    """Index envelope WITHOUT contract proof (no indexToken supplied): stays isolated."""
     [e] = toobit.parse_index_price({"index": {"BTCUSDT": "61367.66"}, "edp": {"BTCUSDT": "61491.64"}}, T0, expected_key="BTCUSDT")
+    return e
+
+
+def idx_env_proven():
+    [e] = toobit.parse_index_price({"index": {"BTCUSDT": "61367.66"}, "edp": {"BTCUSDT": "61491.64"}}, T0,
+                                   expected_key="BTCUSDT", index_token="BTCUSDT", contract_symbol=TSYM)
     return e
 
 
 # ================================================================ isolation of unverified values
 def test_index_envelope_is_not_a_verified_contract_index():
     e = idx_env()
-    assert {"UNVERIFIED_SCHEMA", "UNVERIFIED_CONTRACT_MAPPING"} <= set(e.quality_flags)
+    assert "UNVERIFIED_CONTRACT_MAPPING" in e.quality_flags
     assert e.normalized_payload["contract_mapping"] == "UNVERIFIED" and e.normalized_payload["index_name"] == "BTCUSDT"
     assert e.exchange_symbol == "BTCUSDT" and e.raw_payload["index"] == {"BTCUSDT": "61367.66"}    # source kept
     [w] = toobit.parse_ws({"topic": "index", "data": [{"symbol": "BTCUSDT", "index": "1", "time": MS}]}, T0)
     assert "UNVERIFIED_CONTRACT_MAPPING" in w.quality_flags and w.normalized_payload["contract_mapping"] == "UNVERIFIED"
 
 
-def test_open_interest_has_no_definite_unit_and_is_not_rescaled_or_comparable():
+def test_open_interest_unit_is_base_asset_but_aggregation_open_and_not_rescaled_or_comparable():
     e = oi_env()
     n = e.normalized_payload
-    assert n["unit"] == "UNVERIFIED" and n["aggregation"] == "UNVERIFIED"
-    assert n["unit"] not in ("BASE_ASSET", "CONTRACTS", "QUOTE_NOTIONAL", "USD_NOTIONAL")
+    assert n["unit"] == "BASE_ASSET" and n["contract_coefficient_already_applied"] == "VERIFIED"   # support ticket
+    assert n["aggregation"] == "UNVERIFIED"                                                      # support could not confirm
     assert n["contract_multiplier_applied"] is False and n["comparable_across_exchanges"] is False
     assert n["open_interest"] == Decimal("39449.36077") and e.raw_payload == {"size": "39449.36077", "symbol": TSYM}
-    assert {"UNVERIFIED_SCHEMA", "UNVERIFIED_UNIT"} <= set(e.quality_flags)
+    assert {"UNVERIFIED_SCHEMA", "UNVERIFIED_AGGREGATION"} <= set(e.quality_flags) and "UNVERIFIED_UNIT" not in e.quality_flags
 
 
 def test_verification_edit_alone_never_lifts_isolation(monkeypatch):
-    monkeypatch.setitem(toobit.VERIFICATION, "rest_index_price", toobit.DOC)
     monkeypatch.setitem(toobit.VERIFICATION, "rest_open_interest", toobit.DOC)
-    assert toobit.level("rest_index_price") == toobit.level("rest_open_interest") == toobit.UNVERIFIED
-    assert "UNVERIFIED_SCHEMA" in idx_env().quality_flags and "UNVERIFIED_CONTRACT_MAPPING" in idx_env().quality_flags
-    assert oi_env().normalized_payload["unit"] == "UNVERIFIED" and "UNVERIFIED_UNIT" in oi_env().quality_flags
+    monkeypatch.setitem(toobit.VERIFICATION, "ws_index", toobit.DOC)
+    assert toobit.level("rest_open_interest") == toobit.level("ws_index") == toobit.UNVERIFIED   # open answers remain
+    assert "UNVERIFIED_SCHEMA" in oi_env().quality_flags and "UNVERIFIED_AGGREGATION" in oi_env().quality_flags
+    assert oi_env().normalized_payload["aggregation"] == "UNVERIFIED"
+    assert "UNVERIFIED_CONTRACT_MAPPING" in idx_env().quality_flags                  # no contract proof either
+    [w] = toobit.parse_ws({"topic": "index", "data": [{"symbol": "BTCUSDT", "index": "1", "time": MS}]}, T0)
+    assert "UNVERIFIED_CONTRACT_MAPPING" in w.quality_flags
 
 
-def test_registry_starts_empty_and_every_question_is_open():
-    assert set(toobit.SEMANTIC_QUESTIONS) == {"index_contract_mapping", "oi_size_unit", "oi_contract_multiplier", "oi_aggregation"}
-    assert all(v is None for v in toobit.SEMANTIC_EVIDENCE.values())                 # nothing promoted in the code base
-    assert all(v["status"] == "UNVERIFIED" for v in toobit.semantic_status().values())
-    assert toobit.VERIFICATION["rest_index_price"] == toobit.VERIFICATION["rest_open_interest"] == toobit.UNVERIFIED
+def test_registry_holds_only_the_officially_answered_questions():
+    assert set(toobit.SEMANTIC_QUESTIONS) == {"index_contract_mapping", "ws_index_symbol", "oi_size_unit",
+                                              "oi_contract_multiplier", "oi_aggregation"}
+    st = toobit.semantic_status()
+    answered = {q for q, v in st.items() if v["status"] == "VERIFIED"}
+    assert answered == {"index_contract_mapping", "oi_size_unit", "oi_contract_multiplier"}     # support ticket only
+    assert all("20261120000097" in st[q]["reference"] for q in answered)
+    assert {q for q, v in st.items() if v["status"] == "UNVERIFIED"} == {"ws_index_symbol", "oi_aggregation"}
+    assert toobit.SEMANTIC_EVIDENCE["oi_aggregation"] is None and toobit.SEMANTIC_EVIDENCE["ws_index_symbol"] is None
+    assert toobit.VERIFICATION["rest_open_interest"] == toobit.VERIFICATION["ws_index"] == toobit.UNVERIFIED
+    assert toobit.VERIFICATION["rest_index_price"] == toobit.DOC
 
 
 @pytest.mark.parametrize("bad", [
@@ -102,16 +120,20 @@ def test_malformed_mapping_evidence_fails_index_row(monkeypatch):
 
 
 def test_official_mapping_answer_is_applied_to_same_run_metadata(monkeypatch):
-    # live-shaped contract: index "BTC", quoteAsset "USDT"; without an answer the link is not proven
+    # live-shaped contract: index "BTC", quoteAsset "USDT", indexToken "BTCUSDT"
     info = [contract(quoteAsset="USDT")]
-    assert check(tb(contracts=info), TB, TSYM)[IDX]["verdict"] == "INCONCLUSIVE"
-    monkeypatch.setitem(toobit.SEMANTIC_EVIDENCE, "index_contract_mapping",
-                        official("index_contract_mapping", "INDEX_FIELD_PLUS_QUOTE_ASSET"))
     row = check(tb(contracts=info), TB, TSYM)[IDX]
-    assert row["verdict"] == "PASS" and row["semantics"]["expected_index_name"] == "BTCUSDT"
-    assert check(tb(contracts=[contract(index="ETH", quoteAsset="USDT")]), TB, TSYM)[IDX]["verdict"] == "INCONCLUSIVE"
-    assert "UNVERIFIED_CONTRACT_MAPPING" not in idx_env().quality_flags
-    assert "UNVERIFIED_SCHEMA" in idx_env().quality_flags          # VERIFICATION not edited: schema level unchanged
+    assert row["verdict"] == "PASS" and row["semantics"]["contract_index_token"] == "BTCUSDT"
+    assert row["semantics"]["legacy_index_field"] == "BTC"
+    assert check(tb(contracts=[contract(token=None, quoteAsset="USDT")]), TB, TSYM)[IDX]["verdict"] == "INCONCLUSIVE"
+    p = idx_env_proven()
+    assert "UNVERIFIED_CONTRACT_MAPPING" not in p.quality_flags and "UNVERIFIED_SCHEMA" not in p.quality_flags
+    assert p.normalized_payload["contract_mapping"] == "VERIFIED" and p.symbol == COMMON
+    assert "UNVERIFIED_CONTRACT_MAPPING" in idx_env().quality_flags
+    # the record removed: even a matching token proves nothing
+    monkeypatch.setitem(toobit.SEMANTIC_EVIDENCE, "index_contract_mapping", None)
+    assert "UNVERIFIED_CONTRACT_MAPPING" in idx_env_proven().quality_flags
+    assert check(tb(contracts=info), TB, TSYM)[IDX]["verdict"] == "INCONCLUSIVE"
 
 
 def test_official_oi_answer_sets_unit_but_still_no_rescaling_or_cross_exchange_use(monkeypatch):
@@ -124,8 +146,8 @@ def test_official_oi_answer_sets_unit_but_still_no_rescaling_or_cross_exchange_u
 
 # ================================================================ quality gate
 def test_gate_treats_semantic_flags_as_unverified():
-    assert {"UNVERIFIED_SCHEMA", "UNVERIFIED_CONTRACT_MAPPING", "UNVERIFIED_UNIT"} == set(UNVERIFIED_FLAGS)
-    for flag in ("UNVERIFIED_CONTRACT_MAPPING", "UNVERIFIED_UNIT"):
+    assert {"UNVERIFIED_SCHEMA", "UNVERIFIED_CONTRACT_MAPPING", "UNVERIFIED_UNIT", "UNVERIFIED_AGGREGATION"} == set(UNVERIFIED_FLAGS)
+    for flag in ("UNVERIFIED_CONTRACT_MAPPING", "UNVERIFIED_UNIT", "UNVERIFIED_AGGREGATION"):
         g = DataQualityGate()
         g.on_connect(TB)
         g.observe(MarketEnvelope(source=TB, symbol=COMMON, exchange_symbol=TSYM, event_type=EventType.OPEN_INTEREST,
@@ -196,7 +218,7 @@ def _check_main(resp, monkeypatch):
 def test_check_output_carries_extended_evidence_without_changing_exit_code(monkeypatch):
     resp = dict(tb(), **{COMP: LIVE_COMPONENTS})
     rc, out = _check_main(resp, monkeypatch)
-    assert rc == 0 and out["summary"] == {"PASS": 8, "INCONCLUSIVE": 2}
+    assert rc == 0 and out["summary"] == {"PASS": 9, "INCONCLUSIVE": 1}
     assert COMP not in [r["endpoint"] for r in out["endpoints"]]                      # not part of the REST contract
     assert COMP not in live.required_rest_endpoints(TB)
     [ev] = out["extended_evidence"]
@@ -263,9 +285,11 @@ def test_live_like_toobit_run_core_pass_extended_inconclusive_overall_unchanged(
     assert r["status"] == "INCONCLUSIVE" and r["stages"]["rest"]["status"] == "INCONCLUSIVE"
     exc = {e["data_type"]: e for e in rep["excluded_from_core"]}
     assert set(exc) == {"INDEX_PRICE", "OPEN_INTEREST"}                               # listed, not hidden
-    assert all(e["status"] == "INCONCLUSIVE" and e["used_by_core"] is False and e["reason"] for e in exc.values())
+    assert exc["INDEX_PRICE"]["status"] == "PASS" and exc["OPEN_INTEREST"]["status"] == "INCONCLUSIVE"   # aggregation open
+    assert all(e["used_by_core"] is False and e["reason"] for e in exc.values())
+    assert "oi_aggregation" in exc["OPEN_INTEREST"]["reason"]
     assert rep["downstream_restrictions"]["toobit-futures"]
-    assert set(r["extended_semantics"]["open_official_questions"]) == set(toobit.SEMANTIC_QUESTIONS)
+    assert set(r["extended_semantics"]["open_official_questions"]) == {"ws_index_symbol", "oi_aggregation"}
     md = (tmp_path / "verification-summary.md").read_text(encoding="utf-8")
     assert "core_collection: **PASS**" in md and "overall (full, unchanged): **INCONCLUSIVE**" in md
     assert "downstream restriction" in md

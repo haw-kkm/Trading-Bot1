@@ -13,10 +13,11 @@ REST and WebSocket shapes are DIFFERENT and parsed separately:
   REST  depth     GET /quote/v1/depth                   {"t","b":[[p,q]],"a":[[p,q]]}   (no sequence ids)
   REST  bookTick. GET /quote/v1/contract/ticker/bookTicker [{"t","s","b","bq","a","aq"}]
   REST  mark      GET /quote/v1/markPrice               {"exchangeId","symbolId","price","time"} or list of them
-  REST  index     GET /quote/v1/index                   {"index": {"BTCUSDT": "p"}, "edp": {"BTCUSDT": "p"}}
+  REST  index     GET /quote/v1/index?symbol=<contract indexToken>  {"index": {"BTCUSDT": "p"}, "edp": {"BTCUSDT": "p"}}
+                  (indexToken = exchangeInfo contracts[].indexToken, official rule per support ticket #20261120000097)
   REST  funding   GET /api/v1/futures/fundingRate       [{"symbol","rate","period","nextFundingTime",
                                                            "interest","fundingRateCap","fundingRateFloor"}]  (no "time")
-  REST  OI        GET /quote/v1/openInterest            {"openInterestList": [{"size","symbol"}]}
+  REST  OI        GET /quote/v1/openInterest            {"openInterestList": [{"size","symbol"}]}  (size: base asset, coefficient applied)
   REST  contracts GET /api/v1/exchangeInfo              {"contracts": [{..."contractMultiplier","filters":[...]}]}
   WS    wss://stream.toobit.com  (path /quote/ws/v1)    {"topic","symbol","data":[...],"f","sendTime","params"}
         topics: trade {v,t,p,q,m(true=buy)}, markPrice {symbol,markPrice,time}, index {symbol,index,edp,formula,time},
@@ -46,15 +47,15 @@ DOC_URL = "https://api-docs.toobit.com/api/usdt-m-market-data.html"
 VERIFICATION = {
     "rest_ticker_price": DOC, "rest_trades": DOC, "rest_depth": DOC, "rest_book_ticker": DOC,
     "rest_mark_price": DOC, "rest_funding_rate": DOC, "rest_contract": DOC,
-    # Contract -> index-name relation NOT proven. Docs exchangeInfo example: contract "index": "BTCUSDT" (= the
-    # /quote/v1/index key). OBSERVED live 2026-11-20: BTC-SWAP-USDT has "index": "BTC" (all 792 contracts carry the
-    # bare coin), while the index map is keyed "BTCUSDT" and ?symbol=BTC returns an empty map. check_rest runs
-    # check_index_semantics() against the same run's exchangeInfo and PASSes only if the contract names the key.
-    "rest_index_price": UNVERIFIED,
-    # Unit of `size` NOT proven. Docs: "Total open interest of the platform Specific coins, eg.: ETH in ETHUSDT"
-    # (suggests base coin, no explicit unit, nothing about contractMultiplier). OBSERVED live 2026-11-20: sizes are
-    # neither multiples of contractMultiplier nor of the LOT_SIZE stepSize for any multiplier class (0.0001..100).
-    # That observation neither confirms nor excludes any unit. Never converted with contractMultiplier.
+    # Contract -> index-name relation: OFFICIALLY answered by Toobit Support (ticket #20261120000097, 2026-11-20):
+    # use exchangeInfo contracts[].indexToken as the /quote/v1/index `symbol`. OBSERVED live 2026-11-21: all 795
+    # contracts carry indexToken (BTC-SWAP-USDT -> "BTCUSDT"; 13 differ from index+quote, e.g. 1000PEPE -> "PEPEUSDT").
+    # The rule is applied per contract from the SAME run's exchangeInfo (check_index_semantics / index_token_for);
+    # the legacy `index` field ("BTC") is NOT the mapping key and is never combined into a name.
+    "rest_index_price": DOC,
+    # Unit of `size`: OFFICIALLY BASE_ASSET with the contract coefficient ALREADY applied (same ticket). The
+    # aggregation basis (one side vs long+short, double-count rules) is NOT answered -> the key stays UNVERIFIED
+    # until oi_aggregation is on record. Never converted with contractMultiplier (neither * nor /).
     "rest_open_interest": UNVERIFIED,
     "ws_trade": DOC, "ws_mark_price": DOC, "ws_depth": DOC, "ws_book_ticker": DOC, "ws_kline": DOC,
     "ws_index": UNVERIFIED,
@@ -65,30 +66,48 @@ VERIFICATION = {
 
 # ---------------------------------------------------------------------------------------------------------------
 # SEMANTIC EVIDENCE REGISTRY - the open questions that block index price / open interest from being trusted.
-# Every entry stays None until Toobit OFFICIALLY answers it (support reply or doc revision). A record is
+# An entry stays None until Toobit OFFICIALLY answers it (support reply or doc revision); open: ws_index_symbol, oi_aggregation. A record is
 #   {"value": <one of SEMANTIC_ALLOWED[q]>, "source": "<who/what answered>", "date": "YYYY-MM-DD",
 #    "reference": "<ticket id / doc URL>", "quote": "<verbatim answer>"}
 # and must be added together with a regression test. Observation alone (live values, price similarity, value
 # granularity) is NEVER a valid record. A malformed record fails closed (SemanticEvidenceError at use).
 SEMANTIC_QUESTIONS = {
-    "index_contract_mapping": "Official rule that maps a contract (e.g. BTC-SWAP-USDT, exchangeInfo index='BTC') "
-                              "to its /quote/v1/index key (observed working key: 'BTCUSDT').",
+    "index_contract_mapping": "Official rule that maps a contract (e.g. BTC-SWAP-USDT) to its /quote/v1/index "
+                              "`symbol` (support: exchangeInfo contracts[].indexToken; the `index` field is not the key).",
+    "ws_index_symbol": "Whether the WebSocket 'index' topic is keyed by the same exchangeInfo indexToken as REST "
+                       "/quote/v1/index (the support answer covers the REST endpoint only).",
     "oi_size_unit": "Exact unit of /quote/v1/openInterest openInterestList[].size.",
-    "oi_contract_multiplier": "Whether contractMultiplier must be applied to size (and how).",
+    "oi_contract_multiplier": "Whether the contract coefficient (contractMultiplier) is already applied to size or "
+                              "must still be applied (and how).",
     "oi_aggregation": "How open interest is aggregated (one side of all positions, long+short, ...).",
 }
 SEMANTIC_ALLOWED = {
-    "index_contract_mapping": {"INDEX_FIELD", "INDEX_FIELD_PLUS_QUOTE_ASSET"},
+    "index_contract_mapping": {"INDEX_TOKEN_FIELD"},
+    "ws_index_symbol": {"INDEX_TOKEN_FIELD"},
     "oi_size_unit": {"BASE_ASSET", "CONTRACTS", "QUOTE_NOTIONAL"},
-    "oi_contract_multiplier": {"NOT_APPLIED", "MULTIPLY"},
+    "oi_contract_multiplier": {"ALREADY_APPLIED", "NOT_APPLIED", "MULTIPLY"},
     "oi_aggregation": {"ONE_SIDE", "LONG_PLUS_SHORT"},
 }
-SEMANTIC_EVIDENCE: Dict[str, Optional[dict]] = {q: None for q in SEMANTIC_QUESTIONS}
+SUPPORT_TICKET = {"source": "Toobit Support", "date": "2026-11-20", "reference": "Ticket #20261120000097 (reply 2026-11-20 15:56:04)"}
+SEMANTIC_EVIDENCE: Dict[str, Optional[dict]] = {
+    "index_contract_mapping": {"value": "INDEX_TOKEN_FIELD", **SUPPORT_TICKET,
+                               "quote": "Use the indexToken field of exchangeInfo (BTC -> BTCUSDT) as the symbol of "
+                                        "GET /quote/v1/index."},
+    "ws_index_symbol": None,                     # NOT answered: the support reply covers the REST endpoint only
+    "oi_size_unit": {"value": "BASE_ASSET", **SUPPORT_TICKET,
+                     "quote": "openInterestList[].size is the base-token quantity."},
+    "oi_contract_multiplier": {"value": "ALREADY_APPLIED", **SUPPORT_TICKET,
+                               "quote": "size = contract quantity x contract coefficient, so the coefficient is already "
+                                        "applied to the returned size."},
+    "oi_aggregation": None,                      # NOT answered: support could not confirm one-side vs long+short
+}
 # Which answers a parser key needs before its envelopes may lose their semantic isolation flags.
-SEMANTIC_REQUIREMENTS = {"rest_index_price": ("index_contract_mapping",), "ws_index": ("index_contract_mapping",),
+SEMANTIC_REQUIREMENTS = {"rest_index_price": ("index_contract_mapping",),
+                         "ws_index": ("index_contract_mapping", "ws_index_symbol"),
                          "rest_open_interest": ("oi_size_unit", "oi_contract_multiplier", "oi_aggregation")}
 # Isolation flags: the gate treats each like UNVERIFIED_SCHEMA (never READY, no cross-exchange comparison).
 UNVERIFIED_MAPPING_FLAG, UNVERIFIED_UNIT_FLAG = "UNVERIFIED_CONTRACT_MAPPING", "UNVERIFIED_UNIT"
+UNVERIFIED_AGGREGATION_FLAG = "UNVERIFIED_AGGREGATION"
 
 
 class SemanticEvidenceError(ValueError):
@@ -148,9 +167,9 @@ def _env(key, sym, et, ms, rx, raw, norm, seq=None, common=None, extra_flags=())
 
 
 def index_symbol(symbol: str) -> str:
-    """Index endpoints are keyed by the spot-style name (BTCUSDT), NOT BTC-SWAP-USDT.
-    OBSERVED 2026-11-19 (live): GET /quote/v1/index?symbol=BTC-SWAP-USDT -> {"index":{},"edp":{}} (empty);
-    ?symbol=BTCUSDT -> {"index":{"BTCUSDT":...},...}. WS topic "index" with BTC-SWAP-USDT -> code -100010."""
+    """LEGACY name guess (BASE-SWAP-QUOTE -> BASEQUOTE). NOT the contract->index mapping and not used to build any
+    request: it is wrong for e.g. 1000PEPE-SWAP-USDT (indexToken is PEPEUSDT). The official key is
+    exchangeInfo contracts[].indexToken, see index_token_for()."""
     parts = symbol.split("-")
     if len(parts) != 3 or parts[1] != "SWAP":
         raise EnvelopeError(f"unrecognised Toobit symbol {symbol!r}")
@@ -231,9 +250,13 @@ def _positive(v, name):
     return d
 
 
-def parse_index_price(r, rx, expected_key: Optional[str] = None) -> List[MarketEnvelope]:
+def parse_index_price(r, rx, expected_key: Optional[str] = None, index_token: Optional[str] = None,
+                      contract_symbol: Optional[str] = None) -> List[MarketEnvelope]:
     """`expected_key`: the index name that was requested. Any other key in `index` or `edp` is a response that
-    contradicts the request -> EnvelopeError (another instrument's value is never used)."""
+    contradicts the request -> EnvelopeError (another instrument's value is never used).
+    `index_token` + `contract_symbol`: the contract's exchangeInfo indexToken, supplied ONLY by a caller that
+    resolved it from the same run's metadata. The contract->index link is marked VERIFIED only when the official
+    rule is on record AND the response key equals that token; otherwise the envelope keeps its isolation flag."""
     _need(r, "index")
     if not isinstance(r["index"], dict):
         raise EnvelopeError("index must be a {symbol: price} map")
@@ -251,13 +274,16 @@ def parse_index_price(r, rx, expected_key: Optional[str] = None) -> List[MarketE
         if sym in edp:
             _positive(edp[sym], f"edp[{sym}]")
             norm["edp_10m_avg"] = edp[sym]
-        mapped = semantics_verified("rest_index_price")
-        # Filed under the contract's common symbol for bookkeeping only: the contract->index link is NOT proven
-        # while index_contract_mapping is unanswered, so the envelope says so explicitly (isolation flag + field).
+        proven = (index_token is not None and contract_symbol is not None and sym == index_token
+                  and semantics_verified("rest_index_price") and level("rest_index_price") == DOC)
         norm["index_name"] = sym
-        norm["contract_mapping"] = "VERIFIED" if mapped else UNVERIFIED
+        norm["contract_mapping"] = "VERIFIED" if proven else UNVERIFIED
+        if proven:
+            norm["contract_symbol"] = contract_symbol
+        # Without a proven link the envelope is filed under the index name's common symbol for bookkeeping only.
         out.append(_env("rest_index_price", sym, EventType.INDEX_PRICE, None, rx, {"index": {sym: price}, "edp": edp},
-                        norm, common=_index_common(sym), extra_flags=() if mapped else (UNVERIFIED_MAPPING_FLAG,)))
+                        norm, common=toobit_to_common(contract_symbol) if proven else _index_common(sym),
+                        extra_flags=() if proven else (UNVERIFIED_MAPPING_FLAG,)))
     return out
 
 
@@ -275,19 +301,33 @@ def parse_funding_rate(rows, rx) -> List[MarketEnvelope]:
 OI_DOC_QUOTE = "Total open interest of the platform Specific coins, eg.: ETH in ETHUSDT"
 
 
+def _answer_or_none(question: str) -> Optional[str]:
+    """Official answer, or None if unanswered OR malformed (never trusted)."""
+    try:
+        return semantic_answer(question)
+    except SemanticEvidenceError:
+        return None
+
+
 def _oi_meta() -> dict:
-    """Semantic metadata attached to every Toobit OPEN_INTEREST envelope. A definite unit (BASE_ASSET /
-    CONTRACTS / QUOTE_NOTIONAL) only when ALL official answers are on record; never assumed. The value itself is
-    NEVER rescaled here, and it is never comparable with another exchange's open interest in Stage 0."""
-    ok = semantics_verified("rest_open_interest")
-    return {"unit": semantic_answer("oi_size_unit") if ok else UNVERIFIED,
-            "aggregation": semantic_answer("oi_aggregation") if ok else UNVERIFIED,
-            "contract_multiplier_applied": False, "comparable_across_exchanges": False}
+    """Semantic metadata attached to every Toobit OPEN_INTEREST envelope. The three meanings are tracked SEPARATELY:
+    unit (official: BASE_ASSET), contract coefficient (official: already applied to size) and aggregation basis
+    (open). The value itself is NEVER rescaled here (no * or / contractMultiplier), and it is never comparable
+    with another exchange's open interest in Stage 0 while the aggregation basis is unconfirmed."""
+    unit = _answer_or_none("oi_size_unit")
+    mult = _answer_or_none("oi_contract_multiplier")
+    agg = _answer_or_none("oi_aggregation")
+    return {"unit": unit or UNVERIFIED,
+            "contract_coefficient_already_applied": "VERIFIED" if mult == "ALREADY_APPLIED" else UNVERIFIED,
+            "aggregation": agg or UNVERIFIED,
+            "contract_multiplier_applied": False,        # this code never applies the multiplier itself
+            "comparable_across_exchanges": False}
 
 
 def parse_open_interest(r, rx, expected_symbol: Optional[str] = None) -> List[MarketEnvelope]:
-    """`size` is kept EXACTLY as sent (raw_payload + normalized value, NO contractMultiplier conversion); its
-    unit stays UNVERIFIED (see VERIFICATION). Value sanity is separate from unit: size must be a finite decimal
+    """`size` is kept EXACTLY as sent (raw_payload + normalized value, NO contractMultiplier conversion): officially
+    a base-asset quantity with the contract coefficient already applied; the aggregation basis stays UNVERIFIED
+    (see VERIFICATION / _oi_meta). Value sanity is separate from unit: size must be a finite decimal
     >= 0. `expected_symbol`: any item for another symbol contradicts the request -> EnvelopeError."""
     _need(r, "openInterestList")
     if not isinstance(r["openInterestList"], list):
@@ -300,9 +340,11 @@ def parse_open_interest(r, rx, expected_symbol: Optional[str] = None) -> List[Ma
         if to_decimal(it["size"], "openInterest size") < 0:
             raise EnvelopeError(f"openInterest size must be >= 0, got {it['size']!r}")
         meta = _oi_meta()
+        unit_open = meta["unit"] == UNVERIFIED or meta["contract_coefficient_already_applied"] != "VERIFIED"
+        flags = ((UNVERIFIED_UNIT_FLAG,) if unit_open else ()) \
+            + ((UNVERIFIED_AGGREGATION_FLAG,) if meta["aggregation"] == UNVERIFIED else ())
         out.append(_env("rest_open_interest", it["symbol"], EventType.OPEN_INTEREST, None, rx, it,
-                        {"open_interest": it["size"], **meta},
-                        extra_flags=() if meta["unit"] != UNVERIFIED else (UNVERIFIED_UNIT_FLAG,)))
+                        {"open_interest": it["size"], **meta}, extra_flags=flags))
     return out
 
 
@@ -323,54 +365,72 @@ def find_contract(exchange_info, symbol: str):
     return hits[0], None, False
 
 
+def index_token_for(exchange_info, symbol: str):
+    """-> (indexToken | None, problem | None, contradictory). The /quote/v1/index `symbol` of a contract, read ONLY
+    from THIS contract's exchangeInfo entry (official rule). Never derived from index / base / quote fields.
+    Duplicate contract entries are contradictory metadata; a missing / malformed token is only missing evidence."""
+    contract, problem, bad = find_contract(exchange_info, symbol)
+    if contract is None:
+        return None, problem, bad
+    tok = contract.get("indexToken")
+    if not isinstance(tok, str) or not tok:
+        return None, f"contract {symbol!r} has no usable 'indexToken' string", False
+    if tok != tok.strip() or not tok.isascii() or not tok.isalnum():
+        return None, f"contract {symbol!r} indexToken {tok!r} is not a plain index name", False
+    return tok, None, False
+
+
 def _res(verdict, reason, evidence):
     return {"verdict": verdict, "reason": reason, "evidence": evidence}
 
 
 def check_index_semantics(symbol: str, exchange_info, index_raw, rx) -> dict:
-    """PASS only if this run's contract metadata names EXACTLY the index key the response is keyed by.
-    Price similarity is never evidence. Response contradicting the request -> FAIL; missing link -> INCONCLUSIVE."""
-    queried = index_symbol(symbol)
-    ev = {"queried_index_name": queried, "contract_index_field": None,
-          "response_index_keys": sorted(index_raw.get("index", {})) if isinstance(index_raw, dict) else None,
-          "response_edp_keys": sorted(index_raw.get("edp", {}) or {}) if isinstance(index_raw, dict) else None}
+    """Official rule (support ticket #20261120000097): the index of a contract is exchangeInfo contracts[].indexToken.
+    PASS only if THIS run's contract entry has an indexToken, the response is keyed by exactly that token (and by
+    nothing else), index and edp are valid, and the rule is on record. Price similarity is never evidence; the legacy
+    `index` field is only reported. Response contradicting the request -> FAIL; missing link -> INCONCLUSIVE."""
+    contract, problem, bad = find_contract(exchange_info, symbol)
+    token, _, _ = index_token_for(exchange_info, symbol)
+    legacy = (contract or {}).get("index")
+    idx_map = index_raw.get("index") if isinstance(index_raw, dict) else None
+    edp_map = index_raw.get("edp") if isinstance(index_raw, dict) else None
+    ev = {"contract_index_token": token, "legacy_index_field": legacy if isinstance(legacy, str) else None,
+          "queried_index_name": token,
+          "response_index_keys": sorted(idx_map) if isinstance(idx_map, dict) else None,
+          "response_edp_keys": sorted(edp_map) if isinstance(edp_map, dict) else None,
+          "mapping_rule": "INDEX_TOKEN_FIELD (official rule not on record)"}
+    if contract is None:
+        return _res("FAIL" if bad else "INCONCLUSIVE", f"{problem}: index mapping not proven", ev)
+    if token is None:
+        return _res("INCONCLUSIVE", "contract has no usable indexToken: mapping to the index key not proven "
+                                    "(never derived from the legacy 'index' field)", ev)
     try:
-        envs = parse_index_price(index_raw, rx, expected_key=queried)
+        envs = parse_index_price(index_raw, rx, expected_key=token, index_token=token, contract_symbol=symbol)
     except EnvelopeError as e:
         return _res("FAIL", f"index response contradicts the request/validity rules: {e}", ev)
     if not envs:
         return _res("INCONCLUSIVE", "index map is empty: nothing to verify", ev)
-    contract, problem, bad = find_contract(exchange_info, symbol)
-    if contract is None:
-        return _res("FAIL" if bad else "INCONCLUSIVE", f"{problem}: index mapping not proven", ev)
-    idx = contract.get("index")
-    ev["contract_index_field"] = idx if isinstance(idx, str) else None
-    if not isinstance(idx, str) or not idx:
-        return _res("INCONCLUSIVE", "contract has no 'index' field: mapping to the index key not proven", ev)
     try:
         rule = semantic_answer("index_contract_mapping")
     except SemanticEvidenceError as e:
         return _res("FAIL", f"semantic evidence record is malformed: {e}", ev)
-    ev["mapping_rule"] = rule or "DOC_EXAMPLE_INDEX_FIELD (unconfirmed)"
-    if rule == "INDEX_FIELD_PLUS_QUOTE_ASSET":
-        qa = contract.get("quoteAsset")
-        expected = idx + qa if isinstance(qa, str) and qa else None
-    else:                                     # official INDEX_FIELD, or the documentation example when unanswered
-        expected = idx
-    ev["expected_index_name"] = expected
-    if expected != queried:
-        return _res("INCONCLUSIVE", f"contract index field {idx!r} -> {expected!r} != response key {queried!r} "
-                                    f"(rule: {ev['mapping_rule']}): contract->index mapping not proven", ev)
-    if queried not in (index_raw.get("edp") or {}):
-        return _res("INCONCLUSIVE", f"edp has no entry for {queried!r}", ev)
-    return _res("PASS", f"contract index field equals the response key {queried!r}; index and edp valid", ev)
+    if rule != "INDEX_TOKEN_FIELD":
+        return _res("INCONCLUSIVE", "official indexToken mapping rule is not on record: mapping not proven", ev)
+    ev["mapping_rule"] = rule
+    if token not in (edp_map or {}):
+        return _res("INCONCLUSIVE", f"edp has no entry for {token!r}", ev)
+    return _res("PASS", f"response keyed by the contract's indexToken {token!r}; index and edp valid", ev)
 
 
 def check_open_interest_semantics(symbol: str, exchange_info, oi_raw, rx) -> dict:
-    """Parsing sanity (symbol, finite size >= 0) and UNIT confirmation are separate: sanity failures -> FAIL;
-    sanity OK but unit unconfirmed -> INCONCLUSIVE. The size is never rescaled by contractMultiplier."""
-    ev = {"requested_symbol": symbol, "response_symbols": None, "unit": _oi_meta()["unit"], "doc_quote": OI_DOC_QUOTE,
-          "contract_underlying": None, "contract_multiplier": None, "conversion_applied": False}
+    """Parsing sanity (symbol, finite size >= 0), UNIT / coefficient confirmation and AGGREGATION confirmation are
+    separate: sanity failures -> FAIL; sanity OK but any meaning unconfirmed -> INCONCLUSIVE (a confirmed unit never
+    promotes an unconfirmed aggregation). The size is never rescaled by contractMultiplier."""
+    meta = _oi_meta()
+    ev = {"requested_symbol": symbol, "response_symbols": None, "unit": meta["unit"], "doc_quote": OI_DOC_QUOTE,
+          "contract_coefficient_already_applied": meta["contract_coefficient_already_applied"],
+          "aggregation": meta["aggregation"], "contract_underlying": None, "contract_multiplier": None,
+          "conversion_applied": False}
     if isinstance(oi_raw, dict) and isinstance(oi_raw.get("openInterestList"), list):
         ev["response_symbols"] = [it.get("symbol") for it in oi_raw["openInterestList"] if isinstance(it, dict)]
     try:
@@ -398,9 +458,11 @@ def check_open_interest_semantics(symbol: str, exchange_info, oi_raw, rx) -> dic
     if any(st[q]["status"] == "INVALID_EVIDENCE" for q in need):
         return _res("FAIL", "semantic evidence record for open interest is malformed", ev)
     if level("rest_open_interest") != DOC:
-        return _res("INCONCLUSIVE", "symbol and size are valid, but the UNIT / multiplier / aggregation of size are not "
-                                    f"officially confirmed (open: {ev['open_questions']}) -> stays UNVERIFIED", ev)
-    return _res("PASS", f"symbol and size valid; unit {ev['unit']} officially confirmed", ev)
+        confirmed = [q for q in need if q not in ev["open_questions"]]
+        return _res("INCONCLUSIVE", f"symbol and size valid; officially confirmed: {confirmed}; NOT confirmed: "
+                                    f"{ev['open_questions']} (unit/coefficient and aggregation are separate) -> stays UNVERIFIED", ev)
+    return _res("PASS", f"symbol and size valid; unit {ev['unit']}, coefficient already applied and aggregation "
+                        f"{ev['aggregation']} officially confirmed", ev)
 
 
 def check_index_components(index_name: str, raw) -> dict:
@@ -491,7 +553,9 @@ def parse_ws(msg: Any, rx) -> List[MarketEnvelope]:
             norm = {"index_price": d["index"]}
             if d.get("edp") is not None:
                 norm["edp_10m_avg"] = d["edp"]
-            mapped = semantics_verified("ws_index")
+            # No contract context here and the support answer covers REST only: stays isolated unless the
+            # ws_index_symbol answer is on record (and even then it never proves which contract the push is for).
+            mapped = semantics_verified("ws_index") and level("ws_index") == DOC
             norm["index_name"] = d["symbol"]
             norm["contract_mapping"] = "VERIFIED" if mapped else UNVERIFIED
             out.append(_env("ws_index", d["symbol"], EventType.INDEX_PRICE, d.get("time"), rx, d, norm,
@@ -526,8 +590,10 @@ def ws_subscribe_message(topic: str, symbol: str, binary: bool = False) -> Dict[
     """Subscribe frame per docs: {"symbol","topic","event":"sub","params":{"binary":false}}."""
     if topic not in ("trade", "markPrice", "depth", "diffDepth", "bookTicker", "index") and not topic.startswith("kline_"):
         raise EnvelopeError(f"unsupported topic {topic!r}")
-    if topic == "index":
-        symbol = index_symbol(symbol)         # live: BTC-SWAP-USDT is rejected ("Invalid Symbols!") for this topic
+    if topic == "index" and "-" in symbol:
+        # live: a contract symbol (BTC-SWAP-USDT) is rejected ("Invalid Symbols!") for this topic. The caller must pass
+        # the contract's exchangeInfo indexToken; it is never guessed from the contract symbol here.
+        raise EnvelopeError("index topic needs the contract's exchangeInfo indexToken, not a contract symbol")
     return {"symbol": symbol, "topic": topic, "event": "sub", "params": {"binary": binary}}
 
 

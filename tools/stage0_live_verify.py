@@ -433,10 +433,14 @@ def judge_extended(source, rows, extended_evidence, semantic_questions):
 
 DOWNSTREAM_RESTRICTIONS = {
     "toobit-futures": [
-        "INDEX_PRICE: not a verified per-contract index price (contract->index mapping unconfirmed); envelopes carry "
-        "UNVERIFIED_SCHEMA + UNVERIFIED_CONTRACT_MAPPING, the gate never reports them READY.",
-        "OPEN_INTEREST: raw size only, unit/aggregation UNVERIFIED (no BASE_ASSET/CONTRACTS/USD unit), never rescaled "
-        "by contractMultiplier, never compared or summed with another exchange's open interest.",
+        "INDEX_PRICE: the contract->index rule is exchangeInfo indexToken (support ticket #20261120000097). An envelope is "
+        "treated as mapped only when the contract's own indexToken matched the response key in the same run; envelopes "
+        "without that proof and every WebSocket index push (ws_index_symbol unanswered) keep UNVERIFIED_CONTRACT_MAPPING "
+        "and the gate never reports them READY.",
+        "OPEN_INTEREST: size is a BASE_ASSET quantity with the contract coefficient already applied (support ticket "
+        "#20261120000097) and is kept as sent - never multiplied or divided by contractMultiplier. The AGGREGATION basis "
+        "(one side vs long+short) is UNVERIFIED, so envelopes carry UNVERIFIED_AGGREGATION: never READY, never compared "
+        "or summed with another exchange's open interest, never a strategy input.",
         "No strategy / signal / order input may use these types until the official answers are recorded.",
     ],
 }

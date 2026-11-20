@@ -142,6 +142,7 @@ class LiveRunner:
         self.rest_failures: List[dict] = []
         self.rest_retries = 0
         self.ws_counts: Counter = Counter()           # events that arrived over the WebSocket, by type
+        self.index_token: Optional[str] = None        # Toobit: contract's exchangeInfo indexToken (resolved per run)
         self.rest_counts: Counter = Counter()         # events that came from REST reference polls, by type
         self.end_state: Optional[dict] = None         # gate state captured when collection ended (before close)
         self.last_msg_at: Optional[datetime] = None
@@ -282,13 +283,14 @@ class LiveRunner:
         rx = self.clock
         if src == Source.TOOBIT_FUTURES:
             ts = toobit
-            return [("/api/v1/futures/fundingRate", {"symbol": symbol}, "FUNDING_RATE", lambda r: ts.parse_funding_rate(r, rx())),
+            # exchangeInfo FIRST: its contracts[].indexToken is the only accepted /quote/v1/index key.
+            return [("/api/v1/exchangeInfo", None, "CONTRACT_SPEC", lambda r: [e for e in ts.parse_contracts(r, rx())
+                                                                              if e.exchange_symbol == symbol]),
+                    ("/api/v1/futures/fundingRate", {"symbol": symbol}, "FUNDING_RATE", lambda r: ts.parse_funding_rate(r, rx())),
                     ("/quote/v1/openInterest", {"symbol": symbol}, "OPEN_INTEREST", lambda r: ts.parse_open_interest(r, rx(), expected_symbol=symbol)),
                     ("/quote/v1/markPrice", {"symbol": symbol}, "MARK_PRICE", lambda r: ts.parse_mark_price(r, rx())),
-                    ("/quote/v1/index", {"symbol": toobit.index_symbol(symbol)}, "INDEX_PRICE",
-                     lambda r: ts.parse_index_price(r, rx(), expected_key=toobit.index_symbol(symbol))),
-                    ("/api/v1/exchangeInfo", None, "CONTRACT_SPEC", lambda r: [e for e in ts.parse_contracts(r, rx())
-                                                                              if e.exchange_symbol == symbol])]
+                    ("/quote/v1/index", INDEX_FROM_CONTRACT, "INDEX_PRICE",
+                     lambda r, tok: ts.parse_index_price(r, rx(), expected_key=tok, index_token=tok, contract_symbol=symbol))]
         if src == Source.BINANCE_FUTURES:
             P = binance.FUTURES
             return [("/fapi/v1/openInterest", {"symbol": symbol}, "OPEN_INTEREST", lambda r: [P.parse_open_interest(r, rx())]),
@@ -302,9 +304,21 @@ class LiveRunner:
         the gate: any consumer that needs that data type sees a missing type and never gets READY."""
         common = toobit_to_common(symbol) if src == Source.TOOBIT_FUTURES else binance_to_common(
             symbol, src == Source.BINANCE_FUTURES)
+        info = None                      # this run's exchangeInfo (Toobit): source of the index token
         for path, params, etype, fn in self._reference_calls(src, symbol):
             try:
-                envs = fn(await self._fetch(src, path, params))
+                if params is INDEX_FROM_CONTRACT:
+                    token, problem, _ = toobit.index_token_for(info, symbol)
+                    if token is None:    # fail closed: never request a guessed index name
+                        raise EnvelopeError(f"indexToken unresolved: {problem}")
+                    self.index_token = token
+                    raw = await self._fetch(src, path, {"symbol": token})
+                    envs = fn(raw, token)
+                else:
+                    raw = await self._fetch(src, path, params)
+                    if path == EXCHANGE_INFO_PATH:
+                        info = raw
+                    envs = fn(raw)
                 if not envs:
                     raise EnvelopeError("response contained no usable item")
                 self._ingest_all(envs)
@@ -422,7 +436,9 @@ class LiveRunner:
                 self._open_stream_window()
                 self.c.gate.on_connect(src, [common])
                 for t in topics:
-                    await conn.send(json.dumps(toobit.ws_subscribe_message(t, symbol)))
+                    if t == "index" and self.index_token is None:
+                        raise FatalDataError("index topic requested but the contract's indexToken is unresolved")
+                    await conn.send(json.dumps(toobit.ws_subscribe_message(t, self.index_token if t == "index" else symbol)))
                 self.c.gate.mark_synced(src, common)      # partial-depth snapshots need no sequence sync
                 attempt, quiet = 0, 0
                 while self.clock().timestamp() < deadline:
@@ -500,6 +516,17 @@ EXPECTED_KEYS = {   # documented top-level (dict) or first-item (list) keys; ext
 }
 
 
+class _IndexFromContract:
+    """Marker for the /quote/v1/index `symbol` parameter: it is NOT known when the REST table is built. It is
+    resolved per run from the contract's exchangeInfo indexToken (official rule) - never guessed from the symbol."""
+
+    def __repr__(self):
+        return "<indexToken from exchangeInfo>"
+
+
+INDEX_FROM_CONTRACT = _IndexFromContract()
+
+
 def _is_empty(raw) -> bool:
     return raw is None or raw == [] or raw == {}
 
@@ -523,13 +550,14 @@ def _rest_table(src: Source, symbol: str, rx: datetime):
              ("/quote/v1/depth", {"symbol": symbol, "limit": 5}, "toobit:depth", lambda r: [toobit.parse_depth(symbol, r, rx)], "rest_depth"),
              ("/quote/v1/contract/ticker/bookTicker", {"symbol": symbol}, "toobit:bookTicker", lambda r: toobit.parse_book_ticker(r, rx), "rest_book_ticker"),
              ("/quote/v1/markPrice", {"symbol": symbol}, "toobit:markPrice", lambda r: toobit.parse_mark_price(r, rx), "rest_mark_price"),
-             ("/quote/v1/index", {"symbol": toobit.index_symbol(symbol)}, "toobit:index",
-              lambda r: toobit.parse_index_price(r, rx, expected_key=toobit.index_symbol(symbol)), "rest_index_price"),
+             ("/api/v1/exchangeInfo", None, "toobit:exchangeInfo",
+              lambda r: [e for e in toobit.parse_contracts(r, rx) if e.exchange_symbol == symbol], "rest_contract"),
+             ("/quote/v1/index", INDEX_FROM_CONTRACT, "toobit:index",
+              lambda r, tok: toobit.parse_index_price(r, rx, expected_key=tok, index_token=tok, contract_symbol=symbol),
+              "rest_index_price"),
              ("/api/v1/futures/fundingRate", {"symbol": symbol}, "toobit:funding", lambda r: toobit.parse_funding_rate(r, rx), "rest_funding_rate"),
              ("/quote/v1/openInterest", {"symbol": symbol}, "toobit:oi",
-              lambda r: toobit.parse_open_interest(r, rx, expected_symbol=symbol), "rest_open_interest"),
-             ("/api/v1/exchangeInfo", None, "toobit:exchangeInfo",
-              lambda r: [e for e in toobit.parse_contracts(r, rx) if e.exchange_symbol == symbol], "rest_contract")]
+              lambda r: toobit.parse_open_interest(r, rx, expected_symbol=symbol), "rest_open_interest")]
     else:
         fut = src == Source.BINANCE_FUTURES
         P = binance.FUTURES if fut else binance.SPOT
@@ -561,15 +589,19 @@ EXTENDED_SEMANTIC_ENDPOINTS = {Source.TOOBIT_FUTURES: {"/quote/v1/index": "INDEX
 INDEX_COMPONENTS_PATH = "/quote/v1/indexPriceComponents"
 
 
-async def check_extended(rest: PublicRestClient, src: Source, symbol: str) -> List[dict]:
+async def check_extended(rest: PublicRestClient, src: Source, symbol: str, index_token: Optional[str] = None) -> List[dict]:
     """Extended-semantics EVIDENCE only (not part of the REST contract, never changes the --check exit code).
     Toobit: GET /quote/v1/indexPriceComponents?symbol=<index name> validates that index's structure/values;
     it never proves the contract->index mapping. Reports names/counts only, no prices."""
     if src != Source.TOOBIT_FUTURES:
         return []
-    name = toobit.index_symbol(symbol)
+    name = index_token                   # the contract's exchangeInfo indexToken from the same --check run, or None
     row = {"endpoint": INDEX_COMPONENTS_PATH, "params": {"symbol": name}, "verdict": FAIL, "http_status": None,
            "scope": "extended_semantics", "proves_contract_mapping": False}
+    if not name:
+        row.update(verdict=INCONCLUSIVE, reason="indexToken of the contract unresolved in this run: not requested "
+                                                "(an index name is never guessed from the contract symbol)")
+        return [row]
     try:
         raw = await asyncio.to_thread(rest.get, src, INDEX_COMPONENTS_PATH, {"symbol": name})
     except NetworkDisabled:
@@ -610,6 +642,15 @@ async def check_rest(rest: PublicRestClient, src: Source, symbol: str, now: Call
     out, raws, deferred = [], {}, []
     for path, params, ek, fn, vkey in T:
         row = {"endpoint": path, "verdict": FAIL, "request_ok": False, "http_status": None}
+        if params is INDEX_FROM_CONTRACT:
+            token, problem, contradictory = toobit.index_token_for(raws.get(EXCHANGE_INFO_PATH), symbol)
+            if token is None:        # fail closed: no request for a guessed index name, no fallback
+                row.update(verdict=FAIL if contradictory else INCONCLUSIVE,
+                           reason=f"index not requested: {problem} (indexToken is the only accepted index key)")
+                out.append(row)
+                continue
+            row["index_token"] = token
+            params, fn = {"symbol": token}, (lambda r, _fn=fn, _t=token: _fn(r, _t))
         try:
             raw = await asyncio.to_thread(rest.get, src, path, params)
             row.update(request_ok=True, http_status=200)
@@ -759,7 +800,8 @@ def main(argv=None) -> int:
         out = {"summary": dict(counts), "endpoints": rep}
         if src == Source.TOOBIT_FUTURES:
             try:
-                out["extended_evidence"] = asyncio.run(check_extended(rest, src, args.symbol))
+                tok = next((r.get("index_token") for r in rep if r.get("endpoint") == "/quote/v1/index"), None)
+                out["extended_evidence"] = asyncio.run(check_extended(rest, src, args.symbol, index_token=tok))
             except NetworkDisabled as e:
                 out["extended_evidence"] = [{"endpoint": INDEX_COMPONENTS_PATH, "verdict": FAIL, "reason": f"refused: {e}"}]
             out["semantic_questions"] = toobit.semantic_status()

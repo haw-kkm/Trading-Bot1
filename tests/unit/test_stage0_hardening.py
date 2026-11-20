@@ -275,7 +275,8 @@ def test_full_run_survives_optional_failure_but_fails_closed_on_required_one():
             "/quote/v1/markPrice": seq(*[HttpError(500)] * 4), "/quote/v1/index": seq(*[HttpError(500)] * 4),
             "/api/v1/exchangeInfo": seq(*[HttpError(500)] * 4)}
     clock = Clock()
-    late = MS + 35_000          # REST back-off consumed ~35 s of the fake clock before streaming began
+    late = MS + 28_000          # REST back-off consumed ~28 s of the fake clock before streaming began
+    #                             (exchangeInfo fails -> no indexToken -> /quote/v1/index is NOT requested: 4 failing calls)
     fac = Factory([[tws("bookTicker", {"e": "bookTicker", "E": late, "s": TSYM, "b": "99", "bq": "1", "a": "100", "aq": "1", "t": late}),
                     tws("trade", [{"v": "1", "t": late, "p": "100", "q": "1", "m": True}], f=False)]], clock)
     c = Collector()
@@ -283,9 +284,10 @@ def test_full_run_survives_optional_failure_but_fails_closed_on_required_one():
                    sleep=_Sleeper(clock), rest_policy=RestPolicy(jitter=lambda d: 0.0))
     run(r.run(TB, TSYM, 0.15))
     now = clock()
+    assert r.index_token is None
     assert c.gate.usable(TB, "BTC/USDT:USDT", now, types=["BOOK_TICKER", "TRADE"])
     assert not c.gate.usable(TB, "BTC/USDT:USDT", now, types=["OPEN_INTEREST"])
-    assert len(r.rest_failures) == 5
+    assert len(r.rest_failures) == 4
     # required time unavailable -> never starts streaming
     resp2 = dict(resp)
     resp2["/api/v1/time"] = seq(*[HttpError(500)] * 4)

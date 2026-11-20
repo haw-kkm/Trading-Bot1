@@ -28,11 +28,11 @@ def test_rest_mark_price_uses_symbolId_and_price_object_or_list():
         toobit.parse_mark_price({"symbol": SYM, "price": "1", "time": MS}, RX)
 
 
-def test_rest_index_is_a_symbol_keyed_map_and_unverified():
+def test_rest_index_is_a_symbol_keyed_map_and_isolated_without_contract_proof():
     assert toobit.parse_index_price({"index": {}, "edp": {}}, RX) == []      # empty map: no events (not a crash)
     [e] = toobit.parse_index_price({"index": {"BTCUSDT": "50008.1"}, "edp": {"BTCUSDT": "50007.9"}}, RX)
     assert e.normalized_payload["index_price"] == Decimal("50008.1") and e.normalized_payload["edp_10m_avg"] == Decimal("50007.9")
-    assert e.symbol == "BTC/USDT:USDT" and "UNVERIFIED_SCHEMA" in e.quality_flags
+    assert e.symbol == "BTC/USDT:USDT" and "UNVERIFIED_CONTRACT_MAPPING" in e.quality_flags   # no contract proof given
     with pytest.raises(EnvelopeError):
         toobit.parse_index_price({"price": "1"}, RX)
 
@@ -45,10 +45,11 @@ def test_rest_funding_is_array_without_time():
     assert e.normalized_payload["period"] == "8H" and "DOC_ONLY" in e.quality_flags
 
 
-def test_rest_open_interest_list_with_size_is_unverified_unit():
+def test_rest_open_interest_list_with_size_is_base_asset_with_open_aggregation():
     [e] = toobit.parse_open_interest({"openInterestList": [{"size": "1234.5", "symbol": SYM}]}, RX)
-    assert e.normalized_payload["open_interest"] == Decimal("1234.5") and e.normalized_payload["unit"] == "UNVERIFIED"
-    assert "UNVERIFIED_SCHEMA" in e.quality_flags
+    assert e.normalized_payload["open_interest"] == Decimal("1234.5")
+    assert e.normalized_payload["unit"] == "BASE_ASSET" and e.normalized_payload["aggregation"] == "UNVERIFIED"   # support ticket
+    assert "UNVERIFIED_SCHEMA" in e.quality_flags and "UNVERIFIED_AGGREGATION" in e.quality_flags
     with pytest.raises(EnvelopeError):
         toobit.parse_open_interest({"symbol": SYM, "openInterest": "1"}, RX)       # old (wrong) shape
     assert e.raw_payload["size"] == "1234.5"                                         # raw size preserved
@@ -160,5 +161,6 @@ def test_documented_types_can_be_ready_but_unverified_types_never_are():
 
 def test_every_parser_key_has_a_verification_level():
     assert set(toobit.VERIFICATION.values()) <= {toobit.DOC, toobit.UNVERIFIED}
-    for k in ("rest_index_price", "rest_open_interest", "ws_index", "ws_diff_depth"):
+    for k in ("rest_open_interest", "ws_index", "ws_diff_depth"):         # open official questions / no sequence ids
         assert toobit.VERIFICATION[k] == toobit.UNVERIFIED
+    assert toobit.VERIFICATION["rest_index_price"] == toobit.DOC             # official indexToken rule (support ticket)
