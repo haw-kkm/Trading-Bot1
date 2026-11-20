@@ -13,7 +13,7 @@ from enum import Enum
 from collections import Counter, OrderedDict
 from typing import Dict, List, Optional, Tuple
 
-from .envelope import EventType, MarketEnvelope, Source
+from .envelope import UNVERIFIED_FLAGS, EventType, MarketEnvelope, Source
 from .orderbook import BookState
 
 
@@ -172,7 +172,7 @@ class DataQualityGate:
         found: List[str] = []
         src, sym = env.source.value, env.symbol
         self._seen_types.setdefault((src, sym), set()).add(env.event_type.value)
-        if "UNVERIFIED_SCHEMA" in env.quality_flags:
+        if UNVERIFIED_FLAGS & set(env.quality_flags):      # schema OR semantic link (mapping / unit) unverified
             self._unverified.add((src, sym, env.event_type.value))
         key = (src, sym, env.event_type.value)
 
@@ -309,6 +309,10 @@ class DataQualityGate:
             st = self.status(s_, symbol, now, types=[e_.event_type.value])
             if st != Readiness.READY:
                 return f"NOT_COMPARABLE: {s_.value} is {st.value}"
+        for e_ in (ea, eb):                 # defence in depth: an unconfirmed mapping/unit is never compared
+            bad = sorted(UNVERIFIED_FLAGS & set(e_.quality_flags))
+            if bad:
+                return f"NOT_COMPARABLE: {e_.source.value} {e_.event_type.value} carries {bad}"
         ta, tb = ea.event_time or ea.received_at, eb.event_time or eb.received_at
         if abs(ta - tb) > self.max_pair_skew:
             return f"NOT_COMPARABLE: timestamps differ by {abs(ta - tb)}"

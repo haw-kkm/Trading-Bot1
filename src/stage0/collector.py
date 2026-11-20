@@ -58,7 +58,8 @@ PUBLIC_PATHS = {
     Source.TOOBIT_FUTURES: {"/api/v1/time", "/api/v1/exchangeInfo", "/quote/v1/depth", "/quote/v1/trades",
                             "/quote/v1/contract/ticker/price", "/quote/v1/contract/ticker/bookTicker",
                             "/quote/v1/markPrice", "/quote/v1/index", "/api/v1/futures/fundingRate",
-                            "/quote/v1/openInterest", "/quote/v1/klines"},
+                            "/quote/v1/openInterest", "/quote/v1/klines",
+                            "/quote/v1/indexPriceComponents"},      # extended-semantics evidence only (docs 2026-11-20)
 }
 # Toobit REST host: "The base endpoint is: https://api.toobit.com"
 # (https://api-docs.toobit.com/api/basic-information.html, read 2026-11-20). Live reachability: unverified.

@@ -17,6 +17,13 @@ worst of them (FAIL > NOT_RUN > INCONCLUSIVE > PASS). Exit code: 0 all PASS, 1 a
 environment-blocked sources), 2 no such FAIL but some FAIL/NOT_RUN/INCONCLUSIVE remains. Exit 0 is the ONLY
 code that means "everything required was proven"; 1 and 2 must both be treated as NOT verified by CI.
 
+SCOPES (reported NEXT TO the unchanged `overall` / exit code, never instead of them):
+  core_collection     Core Public Market Data Collection: REST startup/contract rows the core uses, required WS
+                      types received, parsing, per-type freshness, clean collector exit, JSONL line count + SHA-256,
+                      gate READY, and every type the core uses verified (no UNVERIFIED type in core).
+  extended_semantics  Meaning of data the core does NOT use (Toobit index contract mapping, open-interest unit /
+                      aggregation). Excluded from core ONLY if core never uses it; each exclusion is listed with
+                      its status and reason. NOT_APPLICABLE where a source has no such data.
 Extra stages: evidence_integrity (the events JSONL really exists, parses, and reconciles with the collector's
 own counts/SHA-256) and runtime (a fatal/unhealthy collector exit is never hidden by a clean-looking log).
 ws_fresh is judged PER REQUIRED EVENT TYPE (live, accepted events only), not from the overall message gap.
@@ -36,9 +43,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from src.stage0.envelope import Source  # noqa: E402  (after sys.path setup)
-from src.stage0.live import required_rest_endpoints  # noqa: E402  single source of truth: check_rest's request table
+from src.stage0.live import (CORE_TYPES, EXTENDED_SEMANTIC_ENDPOINTS,  # noqa: E402
+                             required_rest_endpoints)  # single source of truth: check_rest's request table
 
 PASS, FAIL, INCONCLUSIVE, NOT_RUN = "PASS", "FAIL", "INCONCLUSIVE", "NOT_RUN"
+NOT_APPLICABLE = "NOT_APPLICABLE"          # scope only: the source has no extended-semantics data
 _ORDER = {FAIL: 3, NOT_RUN: 2, INCONCLUSIVE: 1, PASS: 0}
 
 SOURCES = {
@@ -370,6 +379,121 @@ def judge_ws(collect, summary, required, evidence, stall_s, limits=None):
     return stages
 
 
+def judge_rest_core(check, rows, required, excluded):
+    """judge_rest restricted to the endpoints core uses. The integrity preconditions are checked on the FULL report
+    (check finished, exit code consistent with ALL rows, rows well-formed); only then are the excluded endpoints
+    set aside. A FAIL in an excluded row therefore cannot hide a broken check run."""
+    check = check if isinstance(check, dict) else {}
+    excluded = set(excluded or ())
+    if check.get("timed_out") or check.get("exit_code") not in (0, 1) or not isinstance(rows, list) or not rows \
+            or any(not isinstance(r, dict) for r in rows):
+        return judge_rest(check, rows, required)                      # same FAIL reasons as the full judgement
+    any_fail = any(r.get("verdict") == FAIL for r in rows)
+    if (check.get("exit_code") == 1) != any_fail:
+        return judge_rest(check, rows, required)                      # contradiction -> FAIL
+    core_rows = [r for r in rows if r.get("endpoint") not in excluded]
+    core_required = None if required is None else [e for e in required if e not in excluded]
+    core_code = 1 if any(r.get("verdict") == FAIL for r in core_rows) else 0
+    return judge_rest(dict(check, exit_code=core_code), core_rows, core_required)
+
+
+def _ext_scope(source):
+    from src.stage0.envelope import Source as _S
+    return dict(EXTENDED_SEMANTIC_ENDPOINTS.get(_S(source), {}))
+
+
+def judge_extended(source, rows, extended_evidence, semantic_questions):
+    """Extended Data Semantics: worst of the semantic REST rows and the extra evidence rows. Never PASS while an
+    official semantic question is open. A missing semantic row is FAIL (the check is incomplete)."""
+    scope = _ext_scope(source)
+    if not scope:
+        return {"status": NOT_APPLICABLE, "items": [], "reason": "source has no extended-semantics data"}
+    by_ep = {r.get("endpoint"): r for r in rows if isinstance(r, dict)}
+    items = []
+    for ep, etype in scope.items():
+        r = by_ep.get(ep)
+        st = r.get("verdict") if r and r.get("verdict") in (PASS, INCONCLUSIVE, FAIL) else FAIL
+        items.append({"item": ep, "data_type": etype, "status": st,
+                      "reason": (r or {}).get("reason") or "semantic row missing from the REST check"})
+    for e in extended_evidence or []:
+        st = e.get("verdict") if isinstance(e, dict) and e.get("verdict") in (PASS, INCONCLUSIVE, FAIL) else FAIL
+        items.append({"item": (e or {}).get("endpoint"), "data_type": "INDEX_PRICE (components)", "status": st,
+                      "reason": (e or {}).get("reason"), "proves_contract_mapping": False})
+    qs = semantic_questions if isinstance(semantic_questions, dict) else {}
+    open_q = sorted(q for q, v in qs.items() if not isinstance(v, dict) or v.get("status") != "VERIFIED")
+    if not qs:
+        open_q = ["semantic question registry missing from the REST check output"]
+    status = worst([i["status"] for i in items] + ([INCONCLUSIVE] if open_q else []))
+    if any(isinstance(v, dict) and v.get("status") == "INVALID_EVIDENCE" for v in qs.values()):
+        status = FAIL
+    return {"status": status, "items": items, "open_official_questions": open_q,
+            "reason": ("all extended semantics verified" if status == PASS else
+                       f"{sum(i['status'] != PASS for i in items)} item(s) not PASS; open official questions: {open_q}")}
+
+
+DOWNSTREAM_RESTRICTIONS = {
+    "toobit-futures": [
+        "INDEX_PRICE: not a verified per-contract index price (contract->index mapping unconfirmed); envelopes carry "
+        "UNVERIFIED_SCHEMA + UNVERIFIED_CONTRACT_MAPPING, the gate never reports them READY.",
+        "OPEN_INTEREST: raw size only, unit/aggregation UNVERIFIED (no BASE_ASSET/CONTRACTS/USD unit), never rescaled "
+        "by contractMultiplier, never compared or summed with another exchange's open interest.",
+        "No strategy / signal / order input may use these types until the official answers are recorded.",
+    ],
+}
+
+
+def judge_core(source, stages, rest_core, summary, required_ws):
+    """Core Public Market Data Collection. PASS needs every core check PASS. An extended type may be excluded only
+    if the core never uses it; otherwise its semantics are part of core."""
+    s = summary if isinstance(summary, dict) else {}
+    ext = _ext_scope(source)
+    from src.stage0.envelope import Source as _S
+    core_gate = list(CORE_TYPES.get(_S(source), ()))
+    used_by_core = set(core_gate) | set(required_ws)
+    checks = {"rest_core": {"status": rest_core[0], "reason": rest_core[1]}}
+    for k in ("ws_received", "ws_parsed", "ws_fresh", "gate_ready", "evidence_integrity"):
+        st = stages.get(k, {}).get("status", NOT_RUN)
+        checks[k] = {"status": st, "reason": stages.get(k, {}).get("reason")}
+    code = s.get("exit_code")
+    if "runtime" in stages:
+        checks["collector_exit"] = {"status": stages["runtime"]["status"], "reason": stages["runtime"].get("reason")}
+    elif code == 0 and not isinstance(code, bool):
+        checks["collector_exit"] = {"status": PASS, "reason": "collector exit code 0"}
+    elif code in (2, 3):
+        checks["collector_exit"] = {"status": NOT_RUN, "reason": f"collector exit code {code}: streaming not run"}
+    else:
+        checks["collector_exit"] = {"status": FAIL, "reason": f"collector exit code {code!r}"}
+    per_type = ((s.get("end_of_collection") or {}).get("per_type")) or {}
+    unver = sorted(t for t in used_by_core if per_type.get(t) == "UNVERIFIED")
+    unknown = sorted(t for t in used_by_core if t not in per_type)
+    if unver:
+        sem = {"status": INCONCLUSIVE, "reason": f"core uses UNVERIFIED type(s) {unver}: core cannot PASS"}
+    elif unknown:
+        sem = {"status": INCONCLUSIVE if per_type else NOT_RUN,
+               "reason": f"verification level of core type(s) {unknown} not established at end of data"}
+    else:
+        sem = {"status": PASS, "reason": f"every type the core uses is verified: {sorted(used_by_core)}"}
+    checks["core_types_verified"] = sem
+    excluded, absorbed = [], []
+    for ep, etype in ext.items():
+        if etype in used_by_core:
+            absorbed.append(etype)                         # core needs it: cannot be excluded
+            continue
+        row = next((r for r in stages.get("rest", {}).get("endpoints", []) if isinstance(r, dict) and r.get("endpoint") == ep), {})
+        excluded.append({"item": ep, "data_type": etype, "status": row.get("verdict") or NOT_RUN,
+                         "reason": f"{etype} is not a core gate type nor a required WebSocket type: core never uses it; "
+                                   f"its meaning is judged under extended_semantics ({row.get('reason') or 'no row'})",
+                         "excluded_from": "core_collection", "used_by_core": False})
+    if absorbed:
+        checks["core_types_verified"] = {"status": FAIL if sem["status"] == FAIL else INCONCLUSIVE,
+                                         "reason": f"extended type(s) {absorbed} are core inputs: cannot be excluded"}
+    status = worst([c["status"] for c in checks.values()])
+    bad = [k for k, c in checks.items() if c["status"] != PASS]
+    return {"status": status, "checks": checks, "core_gate_types": core_gate, "required_ws_types": list(required_ws),
+            "excluded": excluded, "excluded_types_used_by_core": absorbed,
+            "reason": "core public market data collection verified" if status == PASS else f"not PASS: {bad}"}
+
+
 def verify(source: str, logdir: Path, seconds: int, timeout: int):
     symbol, flags, required = SOURCES[source]
     base = [sys.executable, "-m", "src.stage0.live", "--source", source, "--symbol", symbol, *flags]
@@ -387,6 +511,12 @@ def verify(source: str, logdir: Path, seconds: int, timeout: int):
     stages = {"rest": {"status": rest_status, "reason": rest_reason, "endpoints": rows,
                        "contract": rest_contract(rows, required_rest)}}
     stages.update(judge_ws(collect, summary, required, evidence, 20.0))
+    ext_scope = _ext_scope(source)
+    ext_evidence = check_result.get("extended_evidence", []) if isinstance(check_result, dict) else []
+    sem_q = check_result.get("semantic_questions") if isinstance(check_result, dict) else None
+    excludable = [ep for ep, t in ext_scope.items() if t not in set(CORE_TYPES.get(Source(source), ())) | set(required)]
+    core = judge_core(source, stages, judge_rest_core(check, rows, required_rest, excludable), summary, required)
+    extended = judge_extended(source, rows, ext_evidence, sem_q)
     # Environment-blocked ONLY if every REST request was HTTP 451 AND streaming was therefore never run
     # (every non-REST stage NOT_RUN). Any other failure next to a 451 is a real failure and is not excused.
     ct = stages["rest"]["contract"]
@@ -397,6 +527,9 @@ def verify(source: str, logdir: Path, seconds: int, timeout: int):
     return {"source": source, "symbol": symbol, "environment_blocked": blocked,
             "blocked_reason": "all REST requests returned HTTP 451 (restricted region/legal; not bypassed)" if blocked else None,
             "status": worst([s["status"] for s in stages.values()]),
+            "core_collection": core, "extended_semantics": extended,
+            "excluded_from_core": core["excluded"],
+            "downstream_restrictions": DOWNSTREAM_RESTRICTIONS.get(source, []) if extended["status"] not in (PASS, NOT_APPLICABLE) else [],
             "stages": stages, "rest_check_run": check, "collection_run": collect,
             "collection_summary": summary, "evidence_integrity": evidence, "required_ws_types": list(required),
             "gate_scope": {"gate_ready_means": "core event types READY at end of data - NOT full source verification",
@@ -404,6 +537,12 @@ def verify(source: str, logdir: Path, seconds: int, timeout: int):
                            "required_types_outside_gate": (stages.get("gate_ready", {}).get("scope") or {}).get(
                                "required_but_outside_gate")},
             "notes": "PASS proves public REST+WS data in THIS runner only; it is not trading readiness."}
+
+
+def scope_status(statuses):
+    """Worst status, ignoring NOT_APPLICABLE; all NOT_APPLICABLE -> NOT_APPLICABLE."""
+    real = [x for x in statuses if x != NOT_APPLICABLE]
+    return worst(real) if real else NOT_APPLICABLE
 
 
 def exit_code(records, overall):
@@ -433,6 +572,16 @@ def markdown_summary(report):
         note = "environment_blocked: HTTP 451 (not bypassed)" if r.get("environment_blocked") else ""
         lines.append(f"| {r['source']} | **{r['status']}** | {g('rest')} | {g('ws_received')} | {g('ws_parsed')} | "
                      f"{g('ws_fresh')} | {g('evidence_integrity')} | {g('gate_ready')} | {note} |")
+    lines += ["", f"**Scope** - core_collection: **{report.get('core_collection_status')}** | extended_semantics: "
+                  f"**{report.get('extended_semantics_status')}** | overall (full, unchanged): **{report['overall']}**", "",
+              "| Market | Core collection | Extended semantics | Excluded from core |", "|---|---|---|---|"]
+    for r in report["results"]:
+        exc = ", ".join(f"{e['data_type']} ({e['status']})" for e in r.get("excluded_from_core", [])) or "-"
+        lines.append(f"| {r['source']} | {r.get('core_collection', {}).get('status', '-')} | "
+                     f"{r.get('extended_semantics', {}).get('status', '-')} | {exc} |")
+    for src_name, items in (report.get("downstream_restrictions") or {}).items():
+        for it in items:
+            lines.append(f"- downstream restriction ({src_name}): {it}")
     lines += ["", "`Gate READY` only means the core event types were fresh at end of data; it is not full source "
               "verification and not trading approval. Live trading remains NOT APPROVED.", ""]
     for r in report["results"]:
@@ -468,7 +617,17 @@ def main(argv=None):
     report = {"created_at_utc": datetime.now(timezone.utc).isoformat(), "python": sys.version.split()[0],
               "verification_seconds": args.seconds, "trading_or_account_requests": False,
               "tested_sources": sources, "overall": overall, "exit_code": code, "exit_meaning": EXIT_MEANING[code],
-              "fully_verified": code == 0, "results": records}
+              "fully_verified": code == 0,
+              "core_collection_status": worst([(r.get("core_collection") or {}).get("status", NOT_RUN) for r in records]),
+              "extended_semantics_status": scope_status([(r.get("extended_semantics") or {}).get("status", NOT_RUN)
+                                                         for r in records]),
+              "scope_note": "overall / exit_code are the FULL verification (unchanged meaning). core_collection_status "
+                            "covers only the data the core uses; extended_semantics_status covers excluded meanings. "
+                            "A core PASS is not full verification and not trading approval.",
+              "excluded_from_core": [dict(e, source=r["source"]) for r in records for e in r.get("excluded_from_core") or []],
+              "downstream_restrictions": {r["source"]: r["downstream_restrictions"] for r in records
+                                          if r.get("downstream_restrictions")},
+              "results": records}
     target = logdir / "verification-report.json"
     target.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     md = markdown_summary(report)
@@ -480,6 +639,8 @@ def main(argv=None):
         line = ", ".join(f"{k}={v['status']}" for k, v in r["stages"].items())
         print(f"{r['source']}: {r['status']} ({line})")
     print(f"Overall: {overall} (exit {code}: {EXIT_MEANING[code]}); evidence: {target}")
+    print(f"Scope: core_collection={report['core_collection_status']} extended_semantics={report['extended_semantics_status']}"
+          f" (overall/exit code unchanged; core PASS is not full verification)")
     if args.github_annotations:
         for r in records:
             line = ", ".join(f"{k}={v['status']}" for k, v in r["stages"].items())

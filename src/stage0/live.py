@@ -551,6 +551,45 @@ SEMANTIC_CHECKS = {"rest_index_price": toobit.check_index_semantics,
                    "rest_open_interest": toobit.check_open_interest_semantics}
 EXCHANGE_INFO_PATH = "/api/v1/exchangeInfo"
 
+# ---- verification SCOPE (tools/stage0_live_verify.py) -------------------------------------------------------
+# Core Public Market Data Collection = receipt, parsing, per-stream freshness, sanity, collector exit and JSONL
+# evidence of the data the core uses. Extended Data Semantics = meaning of data whose contract mapping / unit is
+# not officially confirmed. A type may be EXCLUDED from core only if core never uses it (not a core gate type,
+# not a required WebSocket type); the exclusion is always reported, never hidden.
+EXTENDED_SEMANTIC_ENDPOINTS = {Source.TOOBIT_FUTURES: {"/quote/v1/index": "INDEX_PRICE",
+                                                       "/quote/v1/openInterest": "OPEN_INTEREST"}}
+INDEX_COMPONENTS_PATH = "/quote/v1/indexPriceComponents"
+
+
+async def check_extended(rest: PublicRestClient, src: Source, symbol: str) -> List[dict]:
+    """Extended-semantics EVIDENCE only (not part of the REST contract, never changes the --check exit code).
+    Toobit: GET /quote/v1/indexPriceComponents?symbol=<index name> validates that index's structure/values;
+    it never proves the contract->index mapping. Reports names/counts only, no prices."""
+    if src != Source.TOOBIT_FUTURES:
+        return []
+    name = toobit.index_symbol(symbol)
+    row = {"endpoint": INDEX_COMPONENTS_PATH, "params": {"symbol": name}, "verdict": FAIL, "http_status": None,
+           "scope": "extended_semantics", "proves_contract_mapping": False}
+    try:
+        raw = await asyncio.to_thread(rest.get, src, INDEX_COMPONENTS_PATH, {"symbol": name})
+    except NetworkDisabled:
+        raise
+    except HttpError as e:
+        row.update(http_status=e.status, reason=f"HTTP {e.status}")
+        return [row]
+    except TransportError as e:
+        row["reason"] = f"transport error: {e.kind}"
+        return [row]
+    except ResponseFormatError:
+        row["reason"] = "response is not valid JSON"
+        return [row]
+    except Exception as e:              # extended evidence must never break the REST check: record it as FAIL
+        row["reason"] = f"internal error: {type(e).__name__}"
+        return [row]
+    res = toobit.check_index_components(name, raw)
+    row.update(http_status=200, verdict=res["verdict"], reason=res["reason"], evidence=res["evidence"])
+    return [row]
+
 
 def required_rest_endpoints(src: Source) -> List[str]:
     """Endpoint paths a complete --check run must report exactly once each."""
@@ -717,8 +756,15 @@ def main(argv=None) -> int:
             print(f"REFUSED: {e}", file=sys.stderr)
             return EXIT_REFUSED
         counts = Counter(r["verdict"] for r in rep)
-        print(json.dumps({"summary": dict(counts), "endpoints": rep}, indent=2))
-        return 1 if counts.get(FAIL) else 0
+        out = {"summary": dict(counts), "endpoints": rep}
+        if src == Source.TOOBIT_FUTURES:
+            try:
+                out["extended_evidence"] = asyncio.run(check_extended(rest, src, args.symbol))
+            except NetworkDisabled as e:
+                out["extended_evidence"] = [{"endpoint": INDEX_COMPONENTS_PATH, "verdict": FAIL, "reason": f"refused: {e}"}]
+            out["semantic_questions"] = toobit.semantic_status()
+        print(json.dumps(out, indent=2))
+        return 1 if counts.get(FAIL) else 0          # the REST contract only: extended evidence never changes it
     sink = JsonlSink(args.out) if args.out else None
     col = Collector(max_envelopes=LIVE_MAX_ENVELOPES, max_rejected=LIVE_MAX_REJECTED, sink=sink)
     runner = LiveRunner(col, rest, PublicWsClient(pol))

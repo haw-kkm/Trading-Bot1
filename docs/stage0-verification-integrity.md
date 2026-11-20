@@ -43,3 +43,41 @@ Live public GETs compared on 2026-11-20 (`/api/v1/exchangeInfo`, `/quote/v1/inde
   equal to the file. Missing attestation -> INCONCLUSIVE; any mismatch/corruption -> FAIL. The file is scanned as a stream
   (one line at a time, 16 MiB per-line cap, incremental SHA-256).
 * Collector subprocess exit code must equal the summary `exit_code`; otherwise every WS stage is FAIL.
+
+## Verification scope: core_collection vs extended_semantics (2026-11-20)
+The report keeps `overall` / exit code exactly as before (full verification; Toobit stays INCONCLUSIVE, exit 2 while the
+questions below are open) and adds two scoped results next to it:
+
+| Field | Covers | PASS requires |
+|---|---|---|
+| `core_collection_status` | Core Public Market Data Collection | REST rows the core uses (contract complete, integrity preconditions on the FULL check report), required WS types received, parsing, per-type freshness, collector exit 0, JSONL line count + SHA-256 attestation, gate READY, and every type the core uses verified (`end_of_collection.per_type` OK, none UNVERIFIED) |
+| `extended_semantics_status` | Toobit INDEX_PRICE contract mapping, OPEN_INTEREST unit/multiplier/aggregation | the two semantic REST rows PASS, `indexPriceComponents` evidence valid, and every official question answered; NOT_APPLICABLE for Binance |
+
+* A type is excluded from core ONLY if core never uses it (not in `live.CORE_TYPES`, not a required WS type). Each exclusion
+  is listed in `excluded_from_core` with its status and reason; if core used it, it could not be excluded.
+* `downstream_restrictions` is printed while extended semantics are not PASS. A core PASS is not full verification and
+  not trading approval.
+
+## Isolation of unverified Toobit data
+Audit: nothing outside `src/stage0` imports stage-0 data (no strategy / signal / order path). Inside stage 0 the values
+reach the quality gate, the JSONL evidence and the reports only.
+* INDEX_PRICE envelopes (REST and WS): `UNVERIFIED_SCHEMA` + `UNVERIFIED_CONTRACT_MAPPING`, payload `contract_mapping:
+  UNVERIFIED`, `index_name` = the exchange key; raw payload kept. Filed under the contract's common symbol for bookkeeping only.
+* OPEN_INTEREST envelopes: `UNVERIFIED_SCHEMA` + `UNVERIFIED_UNIT`, payload `unit: UNVERIFIED`, `aggregation: UNVERIFIED`,
+  `contract_multiplier_applied: false`, `comparable_across_exchanges: false`; raw `size` kept, never rescaled.
+* Gate: any flag in `envelope.UNVERIFIED_FLAGS` -> type UNVERIFIED (never READY, `usable()` False); `divergence()` also
+  refuses an event carrying such a flag even if readiness were READY (defence in depth).
+* Note on observations: value granularity (sizes not multiples of `contractMultiplier` / `stepSize`) and price
+  similarity neither confirm nor exclude a unit or mapping.
+
+## Recording an official Toobit answer (not done; registry is empty)
+`toobit.SEMANTIC_EVIDENCE` holds one record per question in `toobit.SEMANTIC_QUESTIONS`:
+`index_contract_mapping`, `oi_size_unit`, `oi_contract_multiplier`, `oi_aggregation`. A record needs `value` (from
+`SEMANTIC_ALLOWED`), `source`, `date`, `reference` (ticket / doc URL) and a verbatim `quote`; a malformed record fails
+closed (FAIL, INVALID_EVIDENCE). The effective level is `toobit.level(key)`: DOC only if `VERIFICATION[key]` is DOC AND
+every required answer is recorded, so editing `VERIFICATION` alone never promotes. Add a regression test with each record.
+
+`GET /quote/v1/indexPriceComponents?symbol=BTCUSDT` (docs: symbol = "Index name, like BTCUSDT") is run by `--check` as
+extended evidence only (`extended_evidence`, not in the REST contract, never changes the --check exit code). Live
+2026-11-20: valid `index` / `edp` / `time`, 6 weighted components; `?symbol=BTC` -> `{}`. It validates the BTCUSDT
+index, never the contract mapping (`proves_contract_mapping: false`).

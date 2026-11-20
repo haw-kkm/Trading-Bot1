@@ -41,6 +41,20 @@ def tb(index=None, oi=None, contracts=None, symbol=TSYM):
     return r
 
 
+def official(q, value):
+    """A well-formed (synthetic, test-only) official-answer record for the semantic registry."""
+    return {"value": value, "source": "test: Toobit API support", "date": "2026-11-20", "reference": "TEST-1",
+            "quote": "synthetic answer used only by this test"}
+
+
+def promote_oi(monkeypatch, unit="BASE_ASSET"):
+    """Simulates the deliberate human edit after an official answer: VERIFICATION + all evidence records."""
+    monkeypatch.setitem(toobit.VERIFICATION, "rest_open_interest", toobit.DOC)
+    monkeypatch.setitem(toobit.SEMANTIC_EVIDENCE, "oi_size_unit", official("oi_size_unit", unit))
+    monkeypatch.setitem(toobit.SEMANTIC_EVIDENCE, "oi_contract_multiplier", official("oi_contract_multiplier", "NOT_APPLIED"))
+    monkeypatch.setitem(toobit.SEMANTIC_EVIDENCE, "oi_aggregation", official("oi_aggregation", "ONE_SIDE"))
+
+
 def verdicts(rep):
     return {k: v["verdict"] for k, v in rep.items()}
 
@@ -204,7 +218,7 @@ def test_size_is_never_rescaled_by_contract_multiplier(mult):
 
 
 def test_open_interest_contract_metadata_missing_never_passes(monkeypatch):
-    monkeypatch.setitem(toobit.VERIFICATION, "rest_open_interest", toobit.DOC)       # even if the unit were promoted
+    promote_oi(monkeypatch)                                                          # even if the unit were confirmed
     assert check(tb(contracts=[contract(mult="0")]), TB, TSYM)[OI]["verdict"] == "INCONCLUSIVE"
     assert check(tb(contracts=[contract(underlying=None)]), TB, TSYM)[OI]["verdict"] == "INCONCLUSIVE"
     assert check(tb(contracts=[]), TB, TSYM)[OI]["verdict"] == "INCONCLUSIVE"
@@ -213,9 +227,12 @@ def test_open_interest_contract_metadata_missing_never_passes(monkeypatch):
 def test_unit_is_only_attached_after_explicit_promotion(monkeypatch):
     assert toobit.VERIFICATION["rest_open_interest"] == toobit.UNVERIFIED          # not auto-approved
     assert check(tb(), TB, TSYM)[OI]["verdict"] == "INCONCLUSIVE"
-    monkeypatch.setitem(toobit.VERIFICATION, "rest_open_interest", toobit.DOC)       # deliberate human edit
+    monkeypatch.setitem(toobit.VERIFICATION, "rest_open_interest", toobit.DOC)       # VERIFICATION edit ALONE...
     rep = check(tb(), TB, TSYM)
-    assert rep[OI]["verdict"] == "PASS" and rep[OI]["semantics"]["unit"] == "BASE_ASSET"
+    assert rep[OI]["verdict"] == "INCONCLUSIVE" and rep[OI]["semantics"]["unit"] == "UNVERIFIED"   # ...never promotes
+    promote_oi(monkeypatch, unit="CONTRACTS")                                        # official answer on record
+    rep = check(tb(), TB, TSYM)
+    assert rep[OI]["verdict"] == "PASS" and rep[OI]["semantics"]["unit"] == "CONTRACTS"
     # promotion never excuses a contradiction
     assert check(tb(oi={"openInterestList": [{"size": "-1", "symbol": TSYM}]}), TB, TSYM)[OI]["verdict"] == "FAIL"
 
@@ -239,7 +256,7 @@ def test_live_observed_shapes_give_8_pass_2_inconclusive_and_overall_inconclusiv
 def test_only_proven_rows_make_rest_pass(monkeypatch):
     rep = check(tb(contracts=[contract(index="BTCUSDT")]), TB, TSYM)            # index proven, OI unit not
     assert verdicts(rep)[IDX] == "PASS" and _judge(rep)[0] == "INCONCLUSIVE"
-    monkeypatch.setitem(toobit.VERIFICATION, "rest_open_interest", toobit.DOC)
+    promote_oi(monkeypatch)
     rep = check(tb(contracts=[contract(index="BTCUSDT")]), TB, TSYM)
     assert all(x == "PASS" for x in verdicts(rep).values()) and _judge(rep)[0] == "PASS"
 
