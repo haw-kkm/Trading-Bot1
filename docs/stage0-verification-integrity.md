@@ -18,11 +18,21 @@ CI: `collect-evidence` uploads evidence and always writes the per-market table; 
 * `gate_ready=PASS` means only "core types READY at end of data" (scope listed in the report), not source verification.
 
 ## Toobit open questions (official docs re-read 2026-11-20, https://api-docs.toobit.com/api/usdt-m-market-data.html)
-| Item | Docs say | Observed/inferred | Status |
+Live public GETs compared on 2026-11-20 (`/api/v1/exchangeInfo`, `/quote/v1/index`, `/quote/v1/openInterest`; no keys).
+
+| Item | Docs say | Observed live (2026-11-20) | Status |
 |---|---|---|---|
-| openInterest `size` | "Total open interest of the platform Specific coins, eg.: ETH in ETHUSDT"; example symbol is ETH-SWAP-USDT (wording and symbol disagree); no unit; no link to `contractMultiplier` | none compared against contract spec | stays UNVERIFIED |
-| index vs BTC-SWAP-USDT | endpoint keyed by BTCUSDT; exchangeInfo contracts carry `"index": "BTCUSDT"`, which suggests the mapping but does not state it | price similarity is not evidence | stays UNVERIFIED (check exchangeInfo `index` field equals the queried name) |
-| diffDepth | page covers REST only; WS sequence semantics not documented here (adapter notes: versions not guaranteed unique) | - | UNVERIFIED; no full order-book reconstruction is claimed |
+| index vs BTC-SWAP-USDT | exchangeInfo example: contract `"index": "BTCUSDT"`; index map keyed `BTCUSDT`; no field table | contract `index` is the bare coin (`"BTC"`, all 792 contracts); `?symbol=BTCUSDT` -> key `BTCUSDT`; `?symbol=BTC` and `?symbol=BTC-SWAP-USDT` -> empty maps. Docs example and live disagree | stays UNVERIFIED -> REST row INCONCLUSIVE |
+| openInterest `size` | "Total open interest of the platform Specific coins, eg.: ETH in ETHUSDT"; example symbol ETH-SWAP-USDT; no explicit unit; nothing about `contractMultiplier` | response symbol equals the requested contract; sizes are multiples of neither `contractMultiplier` nor LOT `stepSize` (checked for multipliers 0.0001..100) -> neither "contract count" nor "sum of base-coin lots" confirmed | stays UNVERIFIED -> REST row INCONCLUSIVE; never rescaled |
+| diffDepth | page covers REST only; WS sequence semantics not documented here (adapter notes: versions not guaranteed unique) | - | UNVERIFIED; no full order-book reconstruction is claimed (out of scope) |
+
+`check_rest` cross-checks both rows against the exchangeInfo response of the SAME run (`live.SEMANTIC_CHECKS`):
+* index: response keys other than the requested index name, or an invalid (<=0 / NaN / Inf / non-numeric) index or edp
+  -> FAIL; empty map, missing contract / `index` field, contract `index` != response key, failed exchangeInfo -> INCONCLUSIVE;
+  PASS only if the contract's own `index` field names exactly the response key.
+* openInterest: item for another symbol, duplicate items, size < 0 / NaN / Inf / non-numeric -> FAIL (value sanity);
+  sanity OK -> INCONCLUSIVE while the UNIT is UNVERIFIED. Unit metadata (`BASE_ASSET`) is attached only after a
+  deliberate `VERIFICATION["rest_open_interest"] = DOC` edit backed by new evidence.
 
 ## Verification chain (second hardening pass)
 `collector process -> collector summary -> JSONL evidence -> verifier -> Actions gate`; a missing or contradictory link blocks PASS.

@@ -47,10 +47,11 @@ def test_rest_funding_is_array_without_time():
 
 def test_rest_open_interest_list_with_size_is_unverified_unit():
     [e] = toobit.parse_open_interest({"openInterestList": [{"size": "1234.5", "symbol": SYM}]}, RX)
-    assert e.normalized_payload["open_interest"] == Decimal("1234.5") and e.normalized_payload["unit"] == "UNDOCUMENTED"
+    assert e.normalized_payload["open_interest"] == Decimal("1234.5") and e.normalized_payload["unit"] == "UNVERIFIED"
     assert "UNVERIFIED_SCHEMA" in e.quality_flags
     with pytest.raises(EnvelopeError):
         toobit.parse_open_interest({"symbol": SYM, "openInterest": "1"}, RX)       # old (wrong) shape
+    assert e.raw_payload["size"] == "1234.5"                                         # raw size preserved
 
 
 def test_rest_contracts_filters_and_multiplier():

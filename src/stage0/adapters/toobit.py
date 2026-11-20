@@ -4,7 +4,8 @@ SOURCE OF TRUTH: Toobit official docs, https://api-docs.toobit.com/ (pages usdt-
 usdt-m-websocket-market-data), read on 2026-11-20. The old toobit-docs.github.io mirror says it is no
 longer updated and was NOT used. Field NAMES below follow those pages; the pages were read through a
 summarising fetch tool, so verbatim response samples were not available: fixtures reproduce the
-documented STRUCTURE with synthetic values. Nothing has been compared with a real response yet.
+documented STRUCTURE with synthetic values. Live public responses were compared on 2026-11-20 for
+exchangeInfo / index / openInterest (see VERIFICATION and docs/stage0-verification-integrity.md).
 
 REST and WebSocket shapes are DIFFERENT and parsed separately:
   REST  price     GET /quote/v1/contract/ticker/price   [{"s","p"}]
@@ -29,7 +30,7 @@ VERIFICATION LEVELS (per data type, see VERIFICATION):
 Promotion to a higher level is a deliberate human edit after a live check (tools: src/stage0/live.py --check).
 Missing/odd fields raise EnvelopeError; nothing is guessed.
 """
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ..envelope import EnvelopeError, EventType, MarketEnvelope, Source, ms_to_utc, to_decimal
 from ..symbols import binance_to_common, toobit_to_common
@@ -45,9 +46,15 @@ DOC_URL = "https://api-docs.toobit.com/api/usdt-m-market-data.html"
 VERIFICATION = {
     "rest_ticker_price": DOC, "rest_trades": DOC, "rest_depth": DOC, "rest_book_ticker": DOC,
     "rest_mark_price": DOC, "rest_funding_rate": DOC, "rest_contract": DOC,
-    # docs silent on the symbol relation of the index map keys (BTCUSDT vs BTC-SWAP-USDT):
+    # Contract -> index-name relation NOT proven. Docs exchangeInfo example: contract "index": "BTCUSDT" (= the
+    # /quote/v1/index key). OBSERVED live 2026-11-20: BTC-SWAP-USDT has "index": "BTC" (all 792 contracts carry the
+    # bare coin), while the index map is keyed "BTCUSDT" and ?symbol=BTC returns an empty map. check_rest runs
+    # check_index_semantics() against the same run's exchangeInfo and PASSes only if the contract names the key.
     "rest_index_price": UNVERIFIED,
-    # docs give no unit for `size` (contracts? base asset?):
+    # Unit of `size` NOT proven. Docs: "Total open interest of the platform Specific coins, eg.: ETH in ETHUSDT"
+    # (suggests base coin, no explicit unit, nothing about contractMultiplier). OBSERVED live 2026-11-20: sizes are
+    # neither multiples of contractMultiplier nor of the LOT_SIZE stepSize for any multiplier class (0.0001..100),
+    # so neither "contract count" nor "sum of base-coin lots" is confirmed. Never converted with contractMultiplier.
     "rest_open_interest": UNVERIFIED,
     "ws_trade": DOC, "ws_mark_price": DOC, "ws_depth": DOC, "ws_book_ticker": DOC, "ws_kline": DOC,
     "ws_index": UNVERIFIED,
@@ -143,15 +150,33 @@ def parse_mark_price(rows, rx) -> List[MarketEnvelope]:
     return out
 
 
-def parse_index_price(r, rx) -> List[MarketEnvelope]:
+def _positive(v, name):
+    """Finite, strictly positive decimal (prices). NaN/Infinity/garbage/<=0 -> EnvelopeError."""
+    d = to_decimal(v, name)
+    if d <= 0:
+        raise EnvelopeError(f"{name}: must be > 0, got {v!r}")
+    return d
+
+
+def parse_index_price(r, rx, expected_key: Optional[str] = None) -> List[MarketEnvelope]:
+    """`expected_key`: the index name that was requested. Any other key in `index` or `edp` is a response that
+    contradicts the request -> EnvelopeError (another instrument's value is never used)."""
     _need(r, "index")
     if not isinstance(r["index"], dict):
         raise EnvelopeError("index must be a {symbol: price} map")
+    edp = r.get("edp", {})
+    if not isinstance(edp, dict):
+        raise EnvelopeError("edp must be a {symbol: price} map")
+    if expected_key is not None:
+        foreign = sorted(set(r["index"]) - {expected_key}) + sorted(set(edp) - {expected_key})
+        if foreign:
+            raise EnvelopeError(f"index response has keys {foreign} other than the requested {expected_key!r}")
     out = []                  # an EMPTY map (wrong symbol form requested) yields no events: callers must treat as no data
     for sym, price in r["index"].items():
+        _positive(price, f"index[{sym}]")
         norm = {"index_price": price}
-        edp = r.get("edp", {})
-        if isinstance(edp, dict) and sym in edp:
+        if sym in edp:
+            _positive(edp[sym], f"edp[{sym}]")
             norm["edp_10m_avg"] = edp[sym]
         out.append(_env("rest_index_price", sym, EventType.INDEX_PRICE, None, rx, {"index": {sym: price}, "edp": edp},
                         norm, common=_index_common(sym)))
@@ -169,15 +194,112 @@ def parse_funding_rate(rows, rx) -> List[MarketEnvelope]:
     return out
 
 
-def parse_open_interest(r, rx) -> List[MarketEnvelope]:
-    """`size` UNIT IS UNDOCUMENTED (contracts vs base asset) -> kept raw, flagged UNVERIFIED."""
+OI_DOC_QUOTE = "Total open interest of the platform Specific coins, eg.: ETH in ETHUSDT"
+
+
+def _oi_unit() -> str:
+    """Unit metadata is attached only once the unit is verified (a deliberate VERIFICATION edit)."""
+    return "BASE_ASSET" if VERIFICATION["rest_open_interest"] == DOC else UNVERIFIED
+
+
+def parse_open_interest(r, rx, expected_symbol: Optional[str] = None) -> List[MarketEnvelope]:
+    """`size` is kept EXACTLY as sent (raw_payload + normalized value, NO contractMultiplier conversion); its
+    unit stays UNVERIFIED (see VERIFICATION). Value sanity is separate from unit: size must be a finite decimal
+    >= 0. `expected_symbol`: any item for another symbol contradicts the request -> EnvelopeError."""
     _need(r, "openInterestList")
+    if not isinstance(r["openInterestList"], list):
+        raise EnvelopeError("openInterestList must be an array")
     out = []
     for it in r["openInterestList"]:
         _need(it, "size", "symbol")
+        if expected_symbol is not None and it["symbol"] != expected_symbol:
+            raise EnvelopeError(f"openInterest item for {it['symbol']!r}, requested {expected_symbol!r}")
+        if to_decimal(it["size"], "openInterest size") < 0:
+            raise EnvelopeError(f"openInterest size must be >= 0, got {it['size']!r}")
         out.append(_env("rest_open_interest", it["symbol"], EventType.OPEN_INTEREST, None, rx, it,
-                        {"open_interest": it["size"], "unit": "UNDOCUMENTED"}))
+                        {"open_interest": it["size"], "unit": _oi_unit()}))
     return out
+
+
+# ============================== REST semantic cross-checks (check_rest) ==============================
+# Each returns {"verdict": PASS|INCONCLUSIVE|FAIL, "reason", "evidence"}; evidence holds names/flags only, no values.
+# The contract metadata is the exchangeInfo response of the SAME run - never a documentation example.
+def find_contract(exchange_info, symbol: str):
+    """-> (contract | None, problem | None, contradictory). Duplicate entries for one symbol are contradictory
+    metadata (FAIL); absent metadata is only missing evidence (INCONCLUSIVE)."""
+    cs = exchange_info.get("contracts") if isinstance(exchange_info, dict) else None
+    if not isinstance(cs, list):
+        return None, "exchangeInfo contracts unavailable in this run", False
+    hits = [c for c in cs if isinstance(c, dict) and c.get("symbol") == symbol]
+    if not hits:
+        return None, f"no exchangeInfo contract for {symbol!r} in this run", False
+    if len(hits) > 1:
+        return None, f"exchangeInfo lists {symbol!r} {len(hits)} times", True
+    return hits[0], None, False
+
+
+def _res(verdict, reason, evidence):
+    return {"verdict": verdict, "reason": reason, "evidence": evidence}
+
+
+def check_index_semantics(symbol: str, exchange_info, index_raw, rx) -> dict:
+    """PASS only if this run's contract metadata names EXACTLY the index key the response is keyed by.
+    Price similarity is never evidence. Response contradicting the request -> FAIL; missing link -> INCONCLUSIVE."""
+    queried = index_symbol(symbol)
+    ev = {"queried_index_name": queried, "contract_index_field": None,
+          "response_index_keys": sorted(index_raw.get("index", {})) if isinstance(index_raw, dict) else None,
+          "response_edp_keys": sorted(index_raw.get("edp", {}) or {}) if isinstance(index_raw, dict) else None}
+    try:
+        envs = parse_index_price(index_raw, rx, expected_key=queried)
+    except EnvelopeError as e:
+        return _res("FAIL", f"index response contradicts the request/validity rules: {e}", ev)
+    if not envs:
+        return _res("INCONCLUSIVE", "index map is empty: nothing to verify", ev)
+    contract, problem, bad = find_contract(exchange_info, symbol)
+    if contract is None:
+        return _res("FAIL" if bad else "INCONCLUSIVE", f"{problem}: index mapping not proven", ev)
+    idx = contract.get("index")
+    ev["contract_index_field"] = idx if isinstance(idx, str) else None
+    if not isinstance(idx, str) or not idx:
+        return _res("INCONCLUSIVE", "contract has no 'index' field: mapping to the index key not proven", ev)
+    if idx != queried:
+        return _res("INCONCLUSIVE", f"contract index field {idx!r} != response key {queried!r} (docs example shows them "
+                                    f"equal): contract->index mapping not proven", ev)
+    if queried not in (index_raw.get("edp") or {}):
+        return _res("INCONCLUSIVE", f"edp has no entry for {queried!r}", ev)
+    return _res("PASS", f"contract index field equals the response key {queried!r}; index and edp valid", ev)
+
+
+def check_open_interest_semantics(symbol: str, exchange_info, oi_raw, rx) -> dict:
+    """Parsing sanity (symbol, finite size >= 0) and UNIT confirmation are separate: sanity failures -> FAIL;
+    sanity OK but unit unconfirmed -> INCONCLUSIVE. The size is never rescaled by contractMultiplier."""
+    ev = {"requested_symbol": symbol, "response_symbols": None, "unit": _oi_unit(), "doc_quote": OI_DOC_QUOTE,
+          "contract_underlying": None, "contract_multiplier": None, "conversion_applied": False}
+    if isinstance(oi_raw, dict) and isinstance(oi_raw.get("openInterestList"), list):
+        ev["response_symbols"] = [it.get("symbol") for it in oi_raw["openInterestList"] if isinstance(it, dict)]
+    try:
+        envs = parse_open_interest(oi_raw, rx, expected_symbol=symbol)
+    except EnvelopeError as e:
+        return _res("FAIL", f"open interest response contradicts the request/validity rules: {e}", ev)
+    if not envs:
+        return _res("INCONCLUSIVE", "openInterestList is empty: nothing to verify", ev)
+    if len(envs) > 1:
+        return _res("FAIL", f"{len(envs)} open-interest items for {symbol!r}: ambiguous", ev)
+    contract, problem, bad = find_contract(exchange_info, symbol)
+    if contract is None:
+        return _res("FAIL" if bad else "INCONCLUSIVE", f"{problem}: unit cannot be related to the contract", ev)
+    ev["contract_underlying"] = contract.get("underlying")
+    ev["contract_multiplier"] = contract.get("contractMultiplier")
+    try:
+        mult_ok = to_decimal(contract.get("contractMultiplier"), "contractMultiplier") > 0
+    except EnvelopeError:
+        mult_ok = False
+    if not mult_ok or not isinstance(contract.get("underlying"), str):
+        return _res("INCONCLUSIVE", "contract underlying/contractMultiplier missing or invalid", ev)
+    if VERIFICATION["rest_open_interest"] != DOC:
+        return _res("INCONCLUSIVE", "symbol and size are valid, but the UNIT of size is not confirmed (docs wording only "
+                                    "suggests base coin; no relation to contractMultiplier stated) -> stays UNVERIFIED", ev)
+    return _res("PASS", "symbol and size valid; unit verified (VERIFICATION promoted)", ev)
 
 
 def parse_contracts(r, rx) -> List[MarketEnvelope]:

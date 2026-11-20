@@ -283,9 +283,10 @@ class LiveRunner:
         if src == Source.TOOBIT_FUTURES:
             ts = toobit
             return [("/api/v1/futures/fundingRate", {"symbol": symbol}, "FUNDING_RATE", lambda r: ts.parse_funding_rate(r, rx())),
-                    ("/quote/v1/openInterest", {"symbol": symbol}, "OPEN_INTEREST", lambda r: ts.parse_open_interest(r, rx())),
+                    ("/quote/v1/openInterest", {"symbol": symbol}, "OPEN_INTEREST", lambda r: ts.parse_open_interest(r, rx(), expected_symbol=symbol)),
                     ("/quote/v1/markPrice", {"symbol": symbol}, "MARK_PRICE", lambda r: ts.parse_mark_price(r, rx())),
-                    ("/quote/v1/index", {"symbol": toobit.index_symbol(symbol)}, "INDEX_PRICE", lambda r: ts.parse_index_price(r, rx())),
+                    ("/quote/v1/index", {"symbol": toobit.index_symbol(symbol)}, "INDEX_PRICE",
+                     lambda r: ts.parse_index_price(r, rx(), expected_key=toobit.index_symbol(symbol))),
                     ("/api/v1/exchangeInfo", None, "CONTRACT_SPEC", lambda r: [e for e in ts.parse_contracts(r, rx())
                                                                               if e.exchange_symbol == symbol])]
         if src == Source.BINANCE_FUTURES:
@@ -522,9 +523,11 @@ def _rest_table(src: Source, symbol: str, rx: datetime):
              ("/quote/v1/depth", {"symbol": symbol, "limit": 5}, "toobit:depth", lambda r: [toobit.parse_depth(symbol, r, rx)], "rest_depth"),
              ("/quote/v1/contract/ticker/bookTicker", {"symbol": symbol}, "toobit:bookTicker", lambda r: toobit.parse_book_ticker(r, rx), "rest_book_ticker"),
              ("/quote/v1/markPrice", {"symbol": symbol}, "toobit:markPrice", lambda r: toobit.parse_mark_price(r, rx), "rest_mark_price"),
-             ("/quote/v1/index", {"symbol": toobit.index_symbol(symbol)}, "toobit:index", lambda r: toobit.parse_index_price(r, rx), "rest_index_price"),
+             ("/quote/v1/index", {"symbol": toobit.index_symbol(symbol)}, "toobit:index",
+              lambda r: toobit.parse_index_price(r, rx, expected_key=toobit.index_symbol(symbol)), "rest_index_price"),
              ("/api/v1/futures/fundingRate", {"symbol": symbol}, "toobit:funding", lambda r: toobit.parse_funding_rate(r, rx), "rest_funding_rate"),
-             ("/quote/v1/openInterest", {"symbol": symbol}, "toobit:oi", lambda r: toobit.parse_open_interest(r, rx), "rest_open_interest"),
+             ("/quote/v1/openInterest", {"symbol": symbol}, "toobit:oi",
+              lambda r: toobit.parse_open_interest(r, rx, expected_symbol=symbol), "rest_open_interest"),
              ("/api/v1/exchangeInfo", None, "toobit:exchangeInfo",
               lambda r: [e for e in toobit.parse_contracts(r, rx) if e.exchange_symbol == symbol], "rest_contract")]
     else:
@@ -542,6 +545,13 @@ def _rest_table(src: Source, symbol: str, rx: datetime):
     return T
 
 
+# REST rows whose MEANING is cross-checked against the exchangeInfo response of the SAME check run. Their verdict
+# comes from the check (PASS only with this run's own evidence), never from a static constant.
+SEMANTIC_CHECKS = {"rest_index_price": toobit.check_index_semantics,
+                   "rest_open_interest": toobit.check_open_interest_semantics}
+EXCHANGE_INFO_PATH = "/api/v1/exchangeInfo"
+
+
 def required_rest_endpoints(src: Source) -> List[str]:
     """Endpoint paths a complete --check run must report exactly once each."""
     return [row[0] for row in _rest_table(src, "BTC-SWAP-USDT" if src == Source.TOOBIT_FUTURES else "BTCUSDT", _utcnow())]
@@ -552,16 +562,19 @@ async def check_rest(rest: PublicRestClient, src: Source, symbol: str, now: Call
       PASS          response received, required structure present, parser produced events, data non-empty
       FAIL          request failed (HTTP/transport) or the structure contradicts the parser's expectation
       INCONCLUSIVE  empty response / no events / docs leave the meaning or unit open (never auto-promoted)
+    Toobit index / openInterest rows are resolved AFTER all requests by SEMANTIC_CHECKS against this run's own
+    exchangeInfo (a failed exchangeInfo request leaves them INCONCLUSIVE, never PASS).
     Reports shapes and counts only - never response values (apart from the clock offset) and no credentials."""
     rx = now()
     tb = src == Source.TOOBIT_FUTURES
     T = _rest_table(src, symbol, rx)
-    out = []
+    out, raws, deferred = [], {}, []
     for path, params, ek, fn, vkey in T:
         row = {"endpoint": path, "verdict": FAIL, "request_ok": False, "http_status": None}
         try:
             raw = await asyncio.to_thread(rest.get, src, path, params)
             row.update(request_ok=True, http_status=200)
+            raws[path] = raw
         except NetworkDisabled:
             raise
         except HttpError as e:
@@ -611,6 +624,9 @@ async def check_rest(rest: PublicRestClient, src: Source, symbol: str, now: Call
         row["parsed_events"] = n
         if n == 0:
             row.update(verdict=INCONCLUSIVE, reason="parsed OK but produced no events for this symbol")
+        elif tb and vkey in SEMANTIC_CHECKS:
+            row.update(verdict=INCONCLUSIVE, structure=PASS, reason="semantic check pending")
+            deferred.append((row, vkey, raw))
         elif vkey and toobit.VERIFICATION.get(vkey) == toobit.UNVERIFIED:
             row.update(verdict=INCONCLUSIVE, structure=PASS,
                        reason="structure matches the parser, but docs leave unit/symbol meaning open (stays UNVERIFIED)")
@@ -619,6 +635,13 @@ async def check_rest(rest: PublicRestClient, src: Source, symbol: str, now: Call
                        reason="structure matches parser" + ("; semantics are DOC-level only (not independently verified)" if tb else
                                                              "; values not independently verified"))
         out.append(row)
+    for row, vkey, raw in deferred:
+        res = SEMANTIC_CHECKS[vkey](symbol, raws.get(EXCHANGE_INFO_PATH), raw, rx)
+        if res["verdict"] not in (PASS, INCONCLUSIVE, FAIL):        # fail closed on anything unexpected
+            res = {"verdict": FAIL, "reason": f"semantic check returned {res['verdict']!r}", "evidence": res.get("evidence")}
+        level = toobit.VERIFICATION.get(vkey)
+        row.update(verdict=res["verdict"], reason=f"semantics: {res['reason']} [static level: {level}]",
+                   semantics=res["evidence"], semantic_verdict=res["verdict"], static_level=level)
     return out
 
 
