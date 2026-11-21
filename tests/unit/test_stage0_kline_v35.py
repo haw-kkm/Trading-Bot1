@@ -111,7 +111,8 @@ def test_same_e_open_to_closed_and_nonmonotone_suspect_counter():
     forming = kline(event_ms=end - 1, high="110", volume=4, close="103")
     final = kline(closed=True, event_ms=end - 1, high="110", volume=4, close="103")
     assert not g.observe(forming)
-    assert not g.observe(final)
+    assert "KLINE_PREMATURE_CLOSE" not in g.observe(final)
+    assert g.issue_counts["CLOSE_EARLY_BY_MS"] == 1
     assert next(iter(g._klines.rows.values())).state == "CLOSED"
     g2 = DataQualityGate()
     g2.observe(kline(high="110", volume=4))
@@ -208,9 +209,9 @@ def test_c_latest_only_and_currency_plus_minus_one_ms():
 def test_close_arriving_one_ms_beyond_currency_is_rejected():
     end = START+60000
     accepted = kline(closed=True, event_ms=START+125000, rx_ms=START+125000)
-    rejected = kline(closed=True, event_ms=START+125001, rx_ms=START+125001)
     assert KlineStore().observe(accepted)[0]
-    assert "KLINE_CURRENCY_EXPIRED" == KlineStore().observe(rejected)[1][0][0]
+    with pytest.raises(EnvelopeError, match="KLINE_CURRENCY_EXPIRED"):
+        kline(closed=True, event_ms=START+125001, rx_ms=START+125001)
 
 
 @pytest.mark.parametrize("field,value", [("x", "false"), ("x", 1), ("T", START+59998),
