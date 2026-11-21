@@ -150,6 +150,47 @@ def test_binance_snapshot_plus_buffered_deltas_then_ready():
     assert "btcusdt@depth@100ms" in fac.conns[0].url and fac.conns[0].closed
 
 
+def test_binance_rejected_kline_raw_is_attested_and_survives_eviction(tmp_path):
+    """Parser-rejected KLINE evidence stays in its own JSONL, even with bounded rejects."""
+    import hashlib
+
+    def frame(event_ms=MS+500, interval="1m", closed=True):
+        body = {"e": "kline", "E": event_ms, "s": "BTCUSDT",
+                "k": {"t": MS, "T": MS + 59999, "s": "BTCUSDT",
+                      "i": interval, "x": closed, "o": "100", "h": "110",
+                      "l": "90", "c": "101", "v": "10"}}
+        return {"stream": "btcusdt@kline_1m", "data": body}
+
+    premature = frame()
+    unsupported = frame(interval="1s", closed=False)
+    bad_other = {"not": "a Binance stream"}
+    r, c, fac, rest, clock = make([[premature, unsupported, bad_other, trade(1)]],
+                                  {"/api/v3/depth": snap(100)})
+    path = tmp_path / "raw.rejected.jsonl"
+    c.rejected_sink = live.RejectedJsonlSink(path)
+    c.max_rejected = 1
+    run(r.run_binance(Source.BINANCE_SPOT, "BTCUSDT", 0.35))
+    attestation = c.rejected_sink.close()
+
+    raw_bytes = path.read_bytes()
+    rows = [json.loads(line) for line in raw_bytes.splitlines()]
+    assert c.total_rejected == 3 and len(c.rejected) == 1
+    assert len(rows) == 2 and attestation["lines"] == 2
+    assert hashlib.sha256(raw_bytes).hexdigest() == attestation["sha256"]
+    assert rows[0]["raw_message"] == premature
+    assert rows[1]["raw_message"] == unsupported
+    assert rows[0]["event_time_ms"] == MS + 500
+    assert rows[0]["close_time_ms"] == MS + 59999
+    assert rows[0]["is_closed"] is True
+    assert rows[1]["is_closed"] is False
+    assert "KLINE_PREMATURE_CLOSE" in rows[0]["error"]
+    assert "KLINE_NOT_SUPPORTED" in rows[1]["error"]
+    assert all(row["source"] == "binance-spot" for row in rows)
+    assert all(row["channel"] == "ws" for row in rows)
+    assert not any("raw_message" in row for row in c.rejected)  # bad non-KLINE only
+    assert any(e.event_type.value == "TRADE" for e in c.envelopes)
+
+
 def test_binance_gap_triggers_resync_with_new_snapshot():
     seq = iter([snap(100), snap(200)])
     r, c, fac, rest, clock = make([[depth(101, 101), depth(105, 106), depth(201, 202)]],
