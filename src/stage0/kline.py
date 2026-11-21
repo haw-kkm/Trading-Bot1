@@ -193,9 +193,10 @@ class KlineStore:
             c.last_observed = env.received_at
             self._prune(env)
             return True, notices
-        if c.ambiguous_e == stamp:
-            return False, [("KLINE_E_TIE_AMBIGUOUS", "excluded tied revision")]
+        if c.ambiguous_e is not None and stamp <= c.ambiguous_e:
+            return False, [("KLINE_E_TIE_AMBIGUOUS", "disputed E or older revision excluded")]
         if c.open_env is None:
+            c.ambiguous_e = None
             c.open_env, c.last_observed = env, env.received_at
             self._prune(env)
             return True, notices
