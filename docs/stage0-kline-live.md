@@ -38,7 +38,7 @@ The v3.5 state machine (`kline.py`), gate and Stage 1 access are **unchanged**.
 | level | when | survives process kill | survives OS crash / power loss |
 |---|---|---|---|
 | buffered `write()` | per record | no | no |
-| `flush()` | every 100 records **or** 1 s (checked on every received frame and on every write), whichever first | **yes** (data is in the OS page cache) | no |
+| `flush()` | every 100 records **or** 1 s, whichever first. The 1 s bound is enforced by a real-time timer in `LiveRunner.run()` (polls every 0.25 s, so worst case ≈ 1.25 s), **independent of WebSocket frames**; also checked on every write and every frame. Direct use of `run_binance()`/`run_toobit()` without `run()` has no timer (frame/write checks only) | **yes** (data is in the OS page cache) | no |
 | `fsync()` | once, on normal close | yes | yes, as far as the OS/drive honour fsync |
 
 `fsync` is intentionally not per event. After a power failure everything written since the OS last wrote back dirty pages

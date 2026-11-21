@@ -548,3 +548,38 @@ def test_futures_two_connections_final_state_is_the_latest_complete_one():
     assert set(r.end_state["core_types"]) == {"TRADE", "BOOK_TICKER", "MARK_PRICE"}
     assert all(r.end_state["per_type"][t] == "OK" for t in r.end_state["core_types"])      # market + public data both present in the one final state
     assert r.reconnects == 0 and r.c.gate.issue_counts.get("DISCONNECTED", 0) == 0
+
+
+def test_flush_is_bounded_even_when_no_websocket_frame_arrives(tmp_path):
+    """A record written, then total WS silence: the file must still become readable within ~flush_every_s."""
+    path = tmp_path / "idle.jsonl"
+    sink = JsonlSink(path, flush_every_s=0.05, flush_every_n=10 ** 6)
+    sink(_env())                                               # buffered, below both thresholds
+    seen = {}
+
+    class Silent:                                              # recv() delivers nothing for 0.3 s
+        async def connect(self, url):
+            pass
+
+        async def send(self, text):
+            pass
+
+        async def recv(self):
+            if "first" not in seen:
+                await asyncio.sleep(0.3)
+                seen["first"] = path.read_bytes()              # no frame was processed in between
+                return "{}"
+            await asyncio.sleep(0.2)
+            return "{}"
+
+        async def close(self):
+            pass
+    pol = NetworkPolicy(allow_binance=True)
+    rest = PublicRestClient(pol, transport=FakeRest(SPOT_REST))
+    r = LiveRunner(Collector(sink=sink), rest, PublicWsClient(pol, Silent), idle_timeout_s=5)
+    r.flush_poll_s = 0.02
+    asyncio.run(r.run(Source.BINANCE_SPOT, "BTCUSDT", 0.45))
+    lines = seen["first"].splitlines()                         # (+ the REST depth-snapshot bootstrap record)
+    assert lines and json.loads(lines[0])["event_type"] == "TRADE"      # our pre-written record: flushed by the timer, not a frame
+    sink.close()
+

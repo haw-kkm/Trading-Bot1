@@ -455,10 +455,7 @@ class LiveRunner:
         if ref is not None:
             self.max_gap_s = max(self.max_gap_s, (now - ref).total_seconds())
         self.last_msg_at = now
-        for sink in (self.c.sink, self.c.rejected_sink):      # bounded-delay durability for idle periods
-            due = getattr(sink, "flush_if_due", None)
-            if due is not None:
-                due()
+        self._flush_sinks_if_due()
 
     def _begin_sync(self, src, common):
         b = self.c.books.setdefault((src, common), LocalOrderBook(src == Source.BINANCE_FUTURES))
@@ -612,10 +609,29 @@ class LiveRunner:
         self.started_at = self.clock()
         await self.sync_clock(src)                 # required (StartupFailure)
         await self.poll_reference(src, symbol)     # optional (isolated, but registered with the gate)
-        if src == Source.TOOBIT_FUTURES:
-            await self.run_toobit(symbol, duration_s)
-        else:
-            await self.run_binance(src, symbol, duration_s)
+        flusher = asyncio.ensure_future(self._periodic_flush())      # bounded flush delay even with NO frames
+        try:
+            if src == Source.TOOBIT_FUTURES:
+                await self.run_toobit(symbol, duration_s)
+            else:
+                await self.run_binance(src, symbol, duration_s)
+        finally:
+            flusher.cancel()
+            await asyncio.gather(flusher, return_exceptions=True)
+
+    flush_poll_s = 0.25
+
+    def _flush_sinks_if_due(self):
+        for sink in (self.c.sink, self.c.rejected_sink):
+            due = getattr(sink, "flush_if_due", None)
+            if due is not None:
+                due()
+
+    async def _periodic_flush(self):
+        """Real-time poll (not the injectable clock): the 1 s flush bound must not depend on frames arriving."""
+        while True:
+            await asyncio.sleep(self.flush_poll_s)
+            self._flush_sinks_if_due()
 
     # ------------------------------------------------------------------ KLINE diagnostics
     def kline_report(self, src: Source, symbol: str) -> dict:

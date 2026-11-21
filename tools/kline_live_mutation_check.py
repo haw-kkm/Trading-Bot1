@@ -1,4 +1,4 @@
-"""Isolated mutation audit for the Binance KLINE LIVE WIRING (L1..L5). Never modifies the checkout.
+"""Isolated mutation audit for the Binance KLINE LIVE WIRING (L1..L6). Never modifies the checkout.
 
 Each weakened branch is written to a temporary copy of src/ and tested independently by
 tests/unit/test_stage0_kline_live_wiring.py. Exit 0 only if the baseline PASSES and every injected fault is
@@ -38,6 +38,12 @@ def edits():
              '    def __call__(self, env):\n        line = env.to_json() + "\\n"\n        self._fh.write(line)\n'
              '        self._h.update(line.encode("utf-8"))\n        self.lines += 1'),
             (LIVE, '    def flush_if_due(self):\n        if self._pending', '    def flush_if_due(self):\n        if False and self._pending'),
+        ],
+        "L6_idle_flush_timer_disabled": [
+            (LIVE, "            await asyncio.sleep(self.flush_poll_s)
+            self._flush_sinks_if_due()",
+             "            await asyncio.sleep(self.flush_poll_s)
+            pass"),
         ],
         "L5_rejected_kline_sidecar_not_written": [
             (COLLECTOR, 'if self.rejected_sink is not None and "raw_message" in entry:',
