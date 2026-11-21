@@ -18,17 +18,20 @@ Exit codes: 0 completed healthy | 2 refused (no network permission/approval) | 3
 import argparse
 import asyncio
 import json
+import os
 import random
 import sys
+import time
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .adapters import binance, toobit
 from .collector import (BINANCE_FUTURES_WS, WS_ALLOWED, WS_URLS, Collector, HttpError, NetworkDisabled,
                         NetworkPolicy, PublicRestClient, ReconnectPolicy, ResponseFormatError, TransportError)
-from .envelope import EnvelopeError, Source
+from .envelope import EnvelopeError, EventType, Source
+from .kline import INTERVAL_MS
 from .orderbook import BookState, LocalOrderBook
 from .symbols import binance_to_common, toobit_to_common
 
@@ -37,7 +40,81 @@ CORE_TYPES = {Source.BINANCE_SPOT: ("TRADE", "BOOK_TICKER"),
               Source.BINANCE_FUTURES: ("TRADE", "BOOK_TICKER", "MARK_PRICE"),
               Source.TOOBIT_FUTURES: ("TRADE", "BOOK_TICKER", "MARK_PRICE")}
 
+# KLINE streaming is opt-in (--kline-intervals). Only these UTC intervals are supported (see kline.py).
+KLINE_INTERVAL_ORDER = ("1m", "5m")
+KLINE_NOTICE_KINDS = ("CLOSE_EARLY_BY_MS", "KLINE_LATE_FINALIZATION")        # diagnostics on ACCEPTED bars
+KLINE_REASON_FOCUS = ("RECEIVE_LAG", "KLINE_NONMONOTONE_COUNT", "KLINE_OPEN_NONMONOTONE", "KLINE_E_TIE_AMBIGUOUS",
+                      "KLINE_CONFLICT", "KLINE_SUSPECT", "OUT_OF_ORDER", "DUPLICATE_EVENT", "LATE_FORMING_UPDATE",
+                      "FUTURE_EVENT_TIME")
+# Histogram edges (ms) - bounded memory, no per-message list.
+CLOSE_DELTA_EDGES = (-1000, 0, 100, 1000, 5000)        # E - (k.T + 1ms) of accepted CLOSED bars
+RECEIVE_LAG_EDGES = (0, 100, 500, 1000, 5000)          # received_at - E of every parsed KLINE
+
 EXIT_OK, EXIT_REFUSED, EXIT_STARTUP, EXIT_RECONNECT, EXIT_INTEGRITY, EXIT_UNHEALTHY = 0, 2, 3, 4, 5, 6
+
+
+def normalize_kline_intervals(value) -> Tuple[str, ...]:
+    """'1m,5m' / ['5m','1m','1m'] -> ('1m','5m'). Only 1m and 5m exist; anything else (1s, 15m, 1h, '', offset
+    variants) is rejected HERE, before any network object is created. Duplicates collapse; order is canonical."""
+    if value is None or (not isinstance(value, str) and len(value) == 0):
+        return ()          # not requested
+    items = [v.strip() for v in value.split(",")] if isinstance(value, str) else [str(v).strip() for v in value]
+    bad = [v for v in items if v not in INTERVAL_MS]
+    if bad or not items:
+        raise ValueError(f"unsupported KLINE interval(s) {bad or ['<empty>']}: only {list(KLINE_INTERVAL_ORDER)} are allowed")
+    return tuple(iv for iv in KLINE_INTERVAL_ORDER if iv in set(items))
+
+
+def _bucket(edges, v) -> int:
+    for i, e in enumerate(edges):
+        if v < e:
+            return i
+    return len(edges)
+
+
+def _hist(edges, counts) -> dict:
+    labels = [f"<{edges[0]}"] + [f"[{a},{b})" for a, b in zip(edges, edges[1:])] + [f">={edges[-1]}"]
+    return dict(zip(labels, counts))
+
+
+class _KlineStat:
+    """Per-interval KLINE accounting. received = parsed + parse_rejected; parsed = gate_accepted + gate_rejected."""
+
+    def __init__(self):
+        self.parsed = self.parse_rejected = self.gate_accepted = self.gate_rejected = self.closed_accepted = 0
+        self.open_accepted = 0
+        self.parse_reject_reasons: Counter = Counter()
+        self.gate_reject_reasons: Counter = Counter()
+        self.notices: Counter = Counter()
+        self.close_delta = [0] * (len(CLOSE_DELTA_EDGES) + 1)
+        self.close_delta_min = self.close_delta_max = None
+        self.rx_lag = [0] * (len(RECEIVE_LAG_EDGES) + 1)
+        self.rx_lag_min = self.rx_lag_max = None
+
+    @staticmethod
+    def _mm(cur_min, cur_max, v):
+        return (v if cur_min is None else min(cur_min, v)), (v if cur_max is None else max(cur_max, v))
+
+    def note_lag(self, ms: int):
+        self.rx_lag[_bucket(RECEIVE_LAG_EDGES, ms)] += 1
+        self.rx_lag_min, self.rx_lag_max = self._mm(self.rx_lag_min, self.rx_lag_max, ms)
+
+    def note_close_delta(self, ms: int):
+        self.close_delta[_bucket(CLOSE_DELTA_EDGES, ms)] += 1
+        self.close_delta_min, self.close_delta_max = self._mm(self.close_delta_min, self.close_delta_max, ms)
+
+    def report(self) -> dict:
+        return {"received": self.parsed + self.parse_rejected, "parsed": self.parsed,
+                "parse_rejected": self.parse_rejected, "gate_accepted": self.gate_accepted,
+                "gate_rejected": self.gate_rejected, "open_accepted": self.open_accepted,
+                "closed_accepted": self.closed_accepted,
+                "parse_reject_reasons": dict(self.parse_reject_reasons),
+                "gate_reject_reasons": dict(self.gate_reject_reasons),
+                "notices": {k: self.notices.get(k, 0) for k in KLINE_NOTICE_KINDS},
+                "close_delta_ms_E_minus_Tplus1": {"histogram": _hist(CLOSE_DELTA_EDGES, self.close_delta),
+                                                  "min": self.close_delta_min, "max": self.close_delta_max},
+                "receive_lag_ms": {"histogram": _hist(RECEIVE_LAG_EDGES, self.rx_lag),
+                                   "min": self.rx_lag_min, "max": self.rx_lag_max}}
 
 
 class WsClosed(Exception):
@@ -131,7 +208,10 @@ class LiveRunner:
                  clock: Callable[[], datetime] = _utcnow, sleep=asyncio.sleep,
                  reconnect: Optional[ReconnectPolicy] = None, max_resyncs: int = 5,
                  ping_interval_s: float = 30.0, idle_timeout_s: float = 20.0,
-                 rest_policy: Optional[RestPolicy] = None):
+                 rest_policy: Optional[RestPolicy] = None, kline_intervals=()):
+        self.kline_intervals = normalize_kline_intervals(kline_intervals)     # ValueError BEFORE any network use
+        self.kline_stats: Dict[str, _KlineStat] = {iv: _KlineStat() for iv in self.kline_intervals}
+        self.end_captures = 0                         # how many connections reported end-of-data (latest capture wins)
         self.c, self.rest, self.ws, self.clock, self.sleep = collector, rest, ws, clock, sleep
         self.reconnect = reconnect or ReconnectPolicy()
         self.rest_policy = rest_policy or RestPolicy()
@@ -213,9 +293,47 @@ class LiveRunner:
         for e in envs:
             t = e.event_type.value
             (self.ws_counts if channel == "ws" else self.rest_counts)[t] += 1
-            self.c._ingest(e)
+            if channel == "ws" and e.event_type == EventType.KLINE:
+                self._ingest_kline(e)
+            else:
+                self.c._ingest(e)
             if channel == "ws" and self.c.gate.is_current(e):
                 self._note_live(t)
+
+    # ---- KLINE accounting: parsed / gate-accepted / CLOSED-accepted are DIFFERENT things -------------------
+    def _kstat(self, interval) -> _KlineStat:
+        return self.kline_stats.setdefault(str(interval), _KlineStat())
+
+    def _ingest_kline(self, e):
+        st = self._kstat(e.normalized_payload["interval"])
+        st.parsed += 1
+        if e.event_time is not None:
+            st.note_lag(int((e.received_at - e.event_time) / timedelta(milliseconds=1)))
+        before = Counter(self.c.gate.issue_counts)
+        self.c._ingest(e)
+        new = Counter(self.c.gate.issue_counts)
+        new.subtract(before)
+        kinds = {k: v for k, v in new.items() if v > 0}
+        if self.c.gate.is_current(e):                      # the gate took THIS update as the bar's current state
+            st.gate_accepted += 1
+            for k in KLINE_NOTICE_KINDS:
+                if k in kinds:
+                    st.notices[k] += kinds[k]
+            if e.normalized_payload["is_closed"]:
+                st.closed_accepted += 1
+                st.note_close_delta(int((e.event_time - datetime.fromtimestamp((e.normalized_payload["close_time_ms"] + 1) / 1000, timezone.utc))
+                                        / timedelta(milliseconds=1)))
+            else:
+                st.open_accepted += 1
+        else:
+            st.gate_rejected += 1
+            for k in (kinds or {"NOT_ACCEPTED_NO_DIAGNOSTIC": 1}):
+                st.gate_reject_reasons[k] += 1
+
+    def _note_kline_parse_reject(self, interval, error: str):
+        st = self._kstat(interval)
+        st.parse_rejected += 1
+        st.parse_reject_reasons[(error.split(": ", 1)[-1].split() or ["?"])[0][:60]] += 1
 
     def _note_live(self, etype: str):
         now = self.clock()
@@ -252,6 +370,7 @@ class LiveRunner:
         """Gate state at the END OF DATA (before the socket close handshake, which can take seconds)."""
         now = self.clock()
         self.end_at = now
+        self.end_captures += 1       # Futures has two connections: each reports; the LATEST capture is the final state
         core = CORE_TYPES[src]
         self.end_state = {"at": now.isoformat(), "core_types": list(core),
                           "readiness": self.c.gate.status(src, common, now, types=core).value,
@@ -336,6 +455,10 @@ class LiveRunner:
         if ref is not None:
             self.max_gap_s = max(self.max_gap_s, (now - ref).total_seconds())
         self.last_msg_at = now
+        for sink in (self.c.sink, self.c.rejected_sink):      # bounded-delay durability for idle periods
+            due = getattr(sink, "flush_if_due", None)
+            if due is not None:
+                due()
 
     def _begin_sync(self, src, common):
         b = self.c.books.setdefault((src, common), LocalOrderBook(src == Source.BINANCE_FUTURES))
@@ -395,7 +518,8 @@ class LiveRunner:
                                          open_time_ms=k.get("t") if isinstance(k, dict) else None,
                                          close_time_ms=k.get("T") if isinstance(k, dict) else None,
                                          is_closed=k.get("x") if isinstance(k, dict) else None,
-                                         raw_message=decoded)
+                                         raw_message=decoded, interval=k.get("i") if isinstance(k, dict) else None)
+                            self._note_kline_parse_reject(entry["interval"], entry["error"])
                         self.c.reject(entry)
                     b = self.c.books.get((src, common)) if with_book else None
                     if b is not None and b.state == BookState.INVALID:
@@ -422,11 +546,13 @@ class LiveRunner:
         common = binance_to_common(symbol, futures)
         s = symbol.lower()
         deadline = self.clock().timestamp() + duration_s
-        if futures:       # routed endpoints: depth+bookTicker on /public, aggTrade+markPrice on /market
+        # KLINE streams (opt-in) are part of the URL, so every reconnect re-subscribes them with the other streams.
+        kl = "".join(f"/{s}@kline_{iv}" for iv in self.kline_intervals)
+        if futures:       # routed endpoints: depth+bookTicker on /public, aggTrade+markPrice+kline on /market
             plan = [(BINANCE_FUTURES_WS["public"] + f"?streams={s}@bookTicker/{s}@depth@100ms", True),
-                    (BINANCE_FUTURES_WS["market"] + f"?streams={s}@aggTrade/{s}@markPrice@1s", False)]
+                    (BINANCE_FUTURES_WS["market"] + f"?streams={s}@aggTrade/{s}@markPrice@1s{kl}", False)]
         else:
-            plan = [(WS_URLS[src] + f"?streams={s}@trade/{s}@bookTicker/{s}@depth@100ms", True)]
+            plan = [(WS_URLS[src] + f"?streams={s}@trade/{s}@bookTicker/{s}@depth@100ms{kl}", True)]
         tasks = [asyncio.ensure_future(self._binance_conn(src, symbol, common, u, wb, deadline)) for u, wb in plan]
         await self._fail_fast(tasks)
 
@@ -491,6 +617,43 @@ class LiveRunner:
         else:
             await self.run_binance(src, symbol, duration_s)
 
+    # ------------------------------------------------------------------ KLINE diagnostics
+    def kline_report(self, src: Source, symbol: str) -> dict:
+        """Opt-in KLINE diagnostics, deliberately NOT part of CORE readiness. Four different things are reported:
+        parsed (envelope built) -> gate_accepted (state machine took it) -> closed_accepted (final bar approved)
+        -> freshness (gate says the newest approved CLOSED is still usable). Stage 1 READY is never declared here."""
+        if not self.kline_intervals:
+            return {"requested_intervals": [], "status": "NOT_REQUESTED", "stage1_trend_ready": "NOT_DECLARED"}
+        common = binance_to_common(symbol, src == Source.BINANCE_FUTURES)
+        now = self.end_at or self.clock()
+        gate = self.c.gate
+        current = gate.kline_ready_intervals(src.value, common, now)
+        latest = gate.latest_closed_klines(src.value, common)
+        per = {}
+        for iv in sorted(self.kline_stats):
+            st = self.kline_stats[iv]
+            row = st.report()
+            row["latest_approved_closed"] = latest.get(iv)
+            if row["received"] == 0:
+                row["freshness"] = "NO_DATA"
+            elif iv in current:
+                row["freshness"] = "CURRENT"
+            elif iv in latest:
+                row["freshness"] = "STALE"
+            else:
+                row["freshness"] = "NO_APPROVED_CLOSED"
+            per[iv] = row
+        reqs = [per[iv]["freshness"] for iv in self.kline_intervals]
+        status = ("NO_DATA" if all(f == "NO_DATA" for f in reqs) else
+                  "GATE_CURRENT_AT_END" if all(f == "CURRENT" for f in reqs) else "PARTIAL")
+        totals = {k: gate.issue_counts.get(k, 0) for k in KLINE_NOTICE_KINDS + KLINE_REASON_FOCUS}
+        return {"requested_intervals": list(self.kline_intervals), "status": status, "evaluated_at": now.isoformat(),
+                "by_interval": per, "gate_issue_totals_all_types": totals,
+                "concepts": {"parsed": "envelope built from a WS frame", "gate_accepted": "state machine took the update",
+                             "closed_accepted": "final bar approved (CLOSED)",
+                             "freshness": "newest approved CLOSED still usable per gate (per interval)"},
+                "core_pass_implies_kline_ready": False, "stage1_trend_ready": "NOT_DECLARED"}
+
     # ------------------------------------------------------------------ verdict
     def health(self, stall_s: float = 20.0) -> Tuple[int, List[str]]:
         """Exit code for a run that ended WITHOUT an exception. A run that produced nothing useful is not success."""
@@ -504,6 +667,9 @@ class LiveRunner:
             reasons.append(f"{n_bad} of {n_ev + n_bad} messages could not be parsed")
         if gap > stall_s:
             reasons.append(f"data stalled for {gap:.0f}s (> {stall_s:.0f}s)")
+        for iv in self.kline_intervals:                  # opt-in: a requested KLINE stream that never produced a frame
+            if self.kline_stats[iv].parsed + self.kline_stats[iv].parse_rejected == 0:
+                reasons.append(f"requested KLINE {iv} produced no frame")
         if self.end_state is not None and self.end_state["readiness"] != "READY":
             core = {k: v for k, v in self.end_state["per_type"].items() if k in self.end_state["core_types"]}
             reasons.append(f"core data types not READY at end of collection ({self.end_state['readiness']}): {core}")
@@ -763,23 +929,73 @@ def _write(out, col):
     return {"lines": n, "sha256": h.hexdigest()}
 
 
-class JsonlSink:
-    """Streams envelopes to a JSONL file as they arrive (bounded memory) and keeps a running SHA-256 + line count."""
+class SinkDurabilityError(OSError):
+    """fsync/flush failed at close: the file may NOT be durable. Never reported as success."""
 
-    def __init__(self, path):
+    def __init__(self, path, cause, attestation):
+        super().__init__(f"durability failure for {path}: {type(cause).__name__}: {cause}")
+        self.attestation = attestation
+
+
+class JsonlSink:
+    """Streams envelopes to a JSONL file as they arrive (bounded memory) and keeps a running SHA-256 + line count.
+
+    DURABILITY LEVELS (be precise about what each guarantees):
+      * write()           data sits in Python's buffer: lost if the process is killed.
+      * flush() (every `flush_every_n` records or `flush_every_s` seconds, whichever first; also from
+        flush_if_due() on every received WS frame): data reaches the OS page cache -> survives a killed
+        PROCESS (SIGKILL/crash) but NOT an OS crash or power loss.
+      * close(): flush() + os.fsync() -> data is on stable storage as far as the OS/drive honour fsync. fsync is
+        NOT called per event (too slow); an OS/power failure mid-run can lose everything written since the OS last
+        wrote back dirty pages. A failing fsync raises SinkDurabilityError (never reported as success)."""
+
+    def __init__(self, path, flush_every_s: float = 1.0, flush_every_n: int = 100, monotonic=time.monotonic,
+                 fsync=None):
         import hashlib
+        self.path = str(path)
         self._fh = open(path, "w", encoding="utf-8", newline="\n")
         self._h, self.lines = hashlib.sha256(), 0
+        self.flush_every_s, self.flush_every_n = flush_every_s, flush_every_n
+        self._mono, self._fsync = monotonic, fsync
+        self._pending, self._last_flush, self.flushes = 0, self._mono(), 0
+        self._closed = False
 
-    def __call__(self, env):
-        line = env.to_json() + "\n"
+    def _emit(self, line: str):
         self._fh.write(line)
         self._h.update(line.encode("utf-8"))
         self.lines += 1
+        self._pending += 1
+        if self._pending >= self.flush_every_n or self._mono() - self._last_flush >= self.flush_every_s:
+            self.flush()
+
+    def __call__(self, env):
+        self._emit(env.to_json() + "\n")
+
+    def flush(self):
+        self._fh.flush()
+        self._pending, self._last_flush = 0, self._mono()
+        self.flushes += 1
+
+    def flush_if_due(self):
+        if self._pending and self._mono() - self._last_flush >= self.flush_every_s:
+            self.flush()
 
     def close(self):
-        self._fh.close()
-        return {"lines": self.lines, "sha256": self._h.hexdigest()}
+        if self._closed:
+            return {"lines": self.lines, "sha256": self._h.hexdigest(), "fsync": "OK"}
+        self._closed = True
+        att = {"lines": self.lines, "sha256": self._h.hexdigest()}
+        err = None
+        try:
+            self._fh.flush()
+            (self._fsync or os.fsync)(self._fh.fileno())      # resolved at call time (testable, never cached)
+        except OSError as e:
+            err = e
+        finally:
+            self._fh.close()
+        if err is not None:
+            raise SinkDurabilityError(self.path, err, att)
+        return {**att, "fsync": "OK"}
 
 
 class RejectedJsonlSink(JsonlSink):
@@ -791,10 +1007,7 @@ class RejectedJsonlSink(JsonlSink):
     """
 
     def __call__(self, entry):
-        line = json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
-        self._fh.write(line)
-        self._h.update(line.encode("utf-8"))
-        self.lines += 1
+        self._emit(json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n")
 
 
 # In-memory retention for a live run: the JSONL sink is the evidence, memory only keeps a recent window.
@@ -808,6 +1021,9 @@ def main(argv=None) -> int:
     ap.add_argument("--seconds", type=float, default=30)
     ap.add_argument("--out", default=None, help="write envelopes as JSONL")
     ap.add_argument("--check", action="store_true", help="REST shape report (PASS/FAIL/INCONCLUSIVE); no streaming")
+    ap.add_argument("--kline-intervals", default=None,
+                    help="opt-in Binance KLINE streaming, comma separated, only 1m and/or 5m (UTC). Requires --out. "
+                         "Not used by --check (REST only).")
     ap.add_argument("--stall-seconds", type=float, default=20.0, help="data gap treated as unhealthy")
     ap.add_argument("--allow-binance-network", action="store_true")
     ap.add_argument("--allow-toobit-network", action="store_true")
@@ -815,6 +1031,17 @@ def main(argv=None) -> int:
                     help="your explicit approval for PUBLIC, unauthenticated Toobit market-data GET/WS only")
     args = ap.parse_args(argv)
     src = Source(args.source)
+    try:                                   # validated BEFORE any policy/network object exists
+        kline_intervals = normalize_kline_intervals(args.kline_intervals)
+    except ValueError as e:
+        print(f"REFUSED: --kline-intervals: {e}", file=sys.stderr)
+        return EXIT_REFUSED
+    if args.kline_intervals is not None and src == Source.TOOBIT_FUTURES:
+        print("REFUSED: --kline-intervals is Binance-only", file=sys.stderr)
+        return EXIT_REFUSED
+    if kline_intervals and not args.check and not args.out:
+        print("REFUSED: KLINE collection requires --out (the evidence files are the record)", file=sys.stderr)
+        return EXIT_REFUSED
     pol = build_policy(args)
     try:
         pol.check(src)
@@ -830,6 +1057,9 @@ def main(argv=None) -> int:
             return EXIT_REFUSED
         counts = Counter(r["verdict"] for r in rep)
         out = {"summary": dict(counts), "endpoints": rep}
+        if kline_intervals:
+            out["kline_streaming"] = {"requested_intervals": list(kline_intervals),
+                                      "status": "NOT_EXERCISED (--check is REST-only; no WebSocket stream was opened)"}
         if src == Source.TOOBIT_FUTURES:
             try:
                 tok = next((r.get("index_token") for r in rep if r.get("endpoint") == "/quote/v1/index"), None)
@@ -844,7 +1074,8 @@ def main(argv=None) -> int:
                      if args.out and src in (Source.BINANCE_SPOT, Source.BINANCE_FUTURES) else None)
     col = Collector(max_envelopes=LIVE_MAX_ENVELOPES, max_rejected=LIVE_MAX_REJECTED,
                     sink=sink, rejected_sink=rejected_sink)
-    runner = LiveRunner(col, rest, PublicWsClient(pol))
+    runner = (LiveRunner(col, rest, PublicWsClient(pol), kline_intervals=kline_intervals) if kline_intervals
+              else LiveRunner(col, rest, PublicWsClient(pol)))       # default path: exactly the pre-KLINE call
     code, reasons, err = EXIT_OK, [], None
     try:
         asyncio.run(runner.run(src, args.symbol, args.seconds))
@@ -859,8 +1090,21 @@ def main(argv=None) -> int:
         code, err = EXIT_INTEGRITY, f"data integrity: {type(e).__name__}: {e}"
     except Exception as e:                                  # internal error: never report as success
         code, err = EXIT_INTEGRITY, f"internal error: {type(e).__name__}"
-    written = sink.close() if sink else None
-    rejected_written = rejected_sink.close() if rejected_sink else None
+    written, rejected_written, durability = None, None, []
+    for name, sk in (("events", sink), ("rejected_kline", rejected_sink)):
+        if sk is None:
+            continue
+        try:
+            res = sk.close()
+        except SinkDurabilityError as e:                      # never reported as a successful write
+            res = {**e.attestation, "fsync": "FAILED"}
+            durability.append(f"{name}: {e}")
+            code = EXIT_INTEGRITY
+            err = err or f"evidence durability failure: {e}"
+        if name == "events":
+            written = res
+        else:
+            rejected_written = res
     common = toobit_to_common(args.symbol) if src == Source.TOOBIT_FUTURES else binance_to_common(
         args.symbol, src == Source.BINANCE_FUTURES)
     print(json.dumps({"exit_code": code, "error": err, "unhealthy_reasons": reasons,
@@ -875,6 +1119,11 @@ def main(argv=None) -> int:
                           {"path": str(args.out) + ".rejected.jsonl", **rejected_written}
                           if rejected_written is not None else None),
                       "rest_failures": runner.rest_failures, "max_gap_s": round(runner.max_gap_s, 1),
+                      "kline_diagnostics": runner.kline_report(src, args.symbol)
+                      if kline_intervals and src in (Source.BINANCE_SPOT, Source.BINANCE_FUTURES) else None,
+                      "collection_end": {"captures": getattr(runner, "end_captures", None),
+                                         "policy": "latest connection report wins"},
+                      "durability_errors": durability,
                       }, indent=2))
     if err:
         print(f"FAILED: {err}", file=sys.stderr)

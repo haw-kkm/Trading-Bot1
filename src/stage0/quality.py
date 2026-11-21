@@ -293,6 +293,17 @@ class DataQualityGate:
         """Intervals with an approved current CLOSED and fresh accepted WS update."""
         return self._klines.current_intervals(source, symbol, now, self._kline_rx, self.max_age)
 
+    def latest_closed_klines(self, source: str, symbol: str) -> Dict[str, dict]:
+        """Newest APPROVED CLOSED bar per interval (diagnostics only; freshness is kline_ready_intervals)."""
+        out: Dict[str, dict] = {}
+        for key, c in self._klines.rows.items():
+            if key[0] != source or key[1] != symbol or c.state != "CLOSED" or c.closed_env is None:
+                continue
+            if key[3] not in out or key[-1] > out[key[3]]["open_time_ms"]:
+                out[key[3]] = {"open_time_ms": key[-1], "event_time": c.closed_env.event_time.isoformat(),
+                               "received_at": c.closed_env.received_at.isoformat()}
+        return out
+
     def approved_klines(self, source: str, symbol: str, now: datetime, lookback: timedelta):
         allowed = self.kline_ready_intervals(source, symbol, now)
         return [e for e in self._klines.approved(source, symbol, now, lookback)
