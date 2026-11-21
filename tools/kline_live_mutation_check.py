@@ -40,10 +40,8 @@ def edits():
             (LIVE, '    def flush_if_due(self):\n        if self._pending', '    def flush_if_due(self):\n        if False and self._pending'),
         ],
         "L6_idle_flush_timer_disabled": [
-            (LIVE, "            await asyncio.sleep(self.flush_poll_s)
-            self._flush_sinks_if_due()",
-             "            await asyncio.sleep(self.flush_poll_s)
-            pass"),
+            (LIVE, "            await asyncio.sleep(self.flush_poll_s)\n            self._flush_sinks_if_due()",
+             "            await asyncio.sleep(self.flush_poll_s)\n            pass"),
         ],
         "L5_rejected_kline_sidecar_not_written": [
             (COLLECTOR, 'if self.rejected_sink is not None and "raw_message" in entry:',
