@@ -122,6 +122,26 @@ def test_same_e_open_to_closed_and_nonmonotone_suspect_counter():
     assert next(iter(g2._klines.rows.values())).state == "SUSPECT"
 
 
+def test_nonmonotone_open_is_ignored_without_poisoning_closed():
+    gate = DataQualityGate()
+    gate.on_connect(SRC)
+    trusted = kline(revision=0, high="110", volume=10)
+    assert gate.observe(trusted) == []
+    before = gate._type_rx[(SRC.value, SYM, "KLINE")]
+    bad_open = kline(revision=1, high="109", volume=9)
+    assert "KLINE_OPEN_NONMONOTONE" in gate.observe(bad_open)
+    state = next(iter(gate._klines.rows.values()))
+    assert state.state == "OPEN" and state.open_env is trusted
+    assert gate._type_rx[(SRC.value, SYM, "KLINE")] == before
+    assert gate.issue_counts["KLINE_NONMONOTONE_COUNT"] == 0
+
+    final = kline(closed=True, revision=11, volume=12, high="111")
+    assert gate.observe(final) == []
+    assert state.state == "CLOSED" and state.closed_env is final
+    assert len(gate._klines.approved(SRC.value, SYM, final.received_at,
+                                    timedelta(hours=1))) == 1
+
+
 def test_conflicting_closes_quarantine_historical_candle():
     ev = [kline(i, closed=True, revision=3) for i in range(25)]
     now = ev[-1].received_at + timedelta(seconds=1)
