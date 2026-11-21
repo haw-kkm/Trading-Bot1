@@ -40,7 +40,8 @@ def kline(i, close, source=FUT, symbol=SYM, xsym="BTCUSDT", high=None, low=None,
     close_t = open_t + timedelta(seconds=59)
     c = Decimal(str(close))
     return env("KLINE", {"open": c, "high": high or c + 1, "low": low or c - 1, "close": c, "volume": vol,
-                         "interval": "1m", "open_time_ms": int(open_t.timestamp() * 1000), "is_closed": closed},
+                         "interval": "1m", "open_time_ms": int(open_t.timestamp() * 1000),
+                          "close_time_ms": int(open_t.timestamp() * 1000) + 59999, "is_closed": closed},
                close_t, close_t + timedelta(milliseconds=100), source, symbol, xsym,
                seq=str(int(open_t.timestamp() * 1000)))
 
