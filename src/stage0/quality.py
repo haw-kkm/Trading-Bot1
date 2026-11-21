@@ -282,7 +282,7 @@ class DataQualityGate:
             rx = self._type_rx.get(k)
             if rx is None:
                 return Readiness.STALE                  # required type missing (never seen / dropped by disconnect)
-            if now < rx or now - rx > self.max_age_by_type.get(t, self.max_age):
+            if now - rx > self.max_age_by_type.get(t, self.max_age):
                 return Readiness.STALE
             if t == "KLINE" and source in (Source.BINANCE_SPOT, Source.BINANCE_FUTURES):
                 if not self.kline_ready_intervals(src, symbol, now):
