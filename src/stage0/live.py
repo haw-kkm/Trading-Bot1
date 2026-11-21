@@ -791,7 +791,7 @@ class RejectedJsonlSink(JsonlSink):
     """
 
     def __call__(self, entry):
-        line = json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\\n"
+        line = json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
         self._fh.write(line)
         self._h.update(line.encode("utf-8"))
         self.lines += 1
