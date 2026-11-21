@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from ...stage0.envelope import MarketEnvelope
+from ...stage0.envelope import EventType, MarketEnvelope
 from ..quality_policy import event_instant
 
 ZERO = Decimal(0)
