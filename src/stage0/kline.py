@@ -216,9 +216,10 @@ class KlineStore:
             c.open_env, c.ambiguous_e = c.previous_open, stamp
             return False, [("KLINE_E_TIE_AMBIGUOUS", "both tied OPEN payloads excluded")]
         if not monotone(c.open_env, env):
-            c.state = "SUSPECT"
-            c.open_env = None
-            return False, [("KLINE_NONMONOTONE_COUNT", "OPEN revision regressed")]
+            # OPEN values never enter analysis. A single anomalous forming update must
+            # not poison a subsequently well-formed CLOSED candle. The last trusted
+            # OPEN stays authoritative for the CLOSED monotonicity check.
+            return False, [("KLINE_OPEN_NONMONOTONE", "OPEN revision regressed; prior OPEN retained")]
         c.previous_open, c.open_env = c.open_env, env
         c.ambiguous_e = None
         c.last_observed = env.received_at
