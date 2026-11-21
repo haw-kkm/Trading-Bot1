@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .envelope import UNVERIFIED_FLAGS, EventType, MarketEnvelope, Source
 from .orderbook import BookState
+from .kline import KlineStore, MAX_CANDLES_PER_KEY, ANALYSIS_LOOKBACK
 
 
 class Readiness(str, Enum):
@@ -84,7 +85,8 @@ class DataQualityGate:
                  max_receive_lag: timedelta = timedelta(seconds=5),
                  max_pair_skew: timedelta = timedelta(seconds=2),
                  divergence_pct: Decimal = Decimal("0.5"), max_seq_history: int = 100_000,
-                 max_issues: int = 10_000):
+                 max_issues: int = 10_000, kline_lookback: timedelta = ANALYSIS_LOOKBACK,
+                 max_candles_per_key: int = MAX_CANDLES_PER_KEY):
         self.max_age, self.max_receive_lag = max_age, max_receive_lag
         self.max_pair_skew, self.divergence_pct = max_pair_skew, divergence_pct
         self.issues: List[Issue] = []                       # newest `max_issues` only (bounded)
@@ -101,6 +103,8 @@ class DataQualityGate:
         self._invalid: Dict[Tuple, str] = {}
         self._unverified: set = set()
         self._prices: Dict[Tuple, MarketEnvelope] = {}
+        self._klines = KlineStore(cap=max_candles_per_key, lookback=kline_lookback)
+        self._kline_rx: Dict[Tuple, datetime] = {}  # (source, common symbol, interval) -> latest valid received_at
 
     def _issue(self, kind, env_or_src, symbol="", detail=""):
         src = env_or_src.source.value if isinstance(env_or_src, MarketEnvelope) else str(env_or_src)
@@ -112,6 +116,10 @@ class DataQualityGate:
     def is_current(self, env: MarketEnvelope) -> bool:
         """True only if `env` is the event the gate accepted as the latest state of its type (i.e. it passed
         every check: not BACKFILL, not duplicate, not out of order, sane timestamp, not crossed)."""
+        if env.event_type == EventType.KLINE and env.source in (Source.BINANCE_SPOT, Source.BINANCE_FUTURES):
+            from .kline import candle_key
+            c = self._klines.rows.get(candle_key(env)) if env.normalized_payload.get("interval") else None
+            return c is not None and (c.open_env is env or c.closed_env is env)
         return self._last.get((env.source.value, env.symbol, env.event_type.value)) is env
 
     def kinds(self):
@@ -126,6 +134,8 @@ class DataQualityGate:
             del self._type_rx[k]
         for k in [k for k in self._bad_ts if k[0] == source.value]:
             del self._bad_ts[k]
+        for k in [k for k in self._kline_rx if k[0] == source.value]:
+            del self._kline_rx[k]
 
     def on_connect(self, source: Source, symbols=()):
         """A (re)connection starts a re-sync: symbols stay SYNCING until mark_synced()."""
@@ -192,6 +202,21 @@ class DataQualityGate:
             # type, and the type stays INVALID until a sane event of the same type arrives.
             self._bad_ts[key] = "future event time" if "FUTURE_EVENT_TIME" in env.quality_flags else "receive lag"
             return found
+        # A candle's opening time identifies a BAR, never its individual revisions. Keep
+        # the existing generic sequence/order logic unchanged for every other event type.
+        if env.event_type == EventType.KLINE and env.source in (Source.BINANCE_SPOT, Source.BINANCE_FUTURES):
+            if backfill or UNVERIFIED_FLAGS & set(env.quality_flags):
+                return found
+            accepted, diagnostics = self._klines.observe(env)
+            for kind, detail in diagnostics:
+                flag(kind, detail)
+            if not accepted:
+                return found
+            self._last[key] = env
+            self._type_rx[key] = env.received_at
+            self._kline_rx[(src, sym, env.normalized_payload["interval"])] = env.received_at
+            self._bad_ts.pop(key, None)
+            return found
         if env.sequence_id is not None and env.event_type != EventType.ORDERBOOK_SNAPSHOT:
             seen = self._seen_seq.setdefault(key, _SeqWindow(self.max_seq_history))
             if env.sequence_id in seen:
@@ -257,9 +282,21 @@ class DataQualityGate:
             rx = self._type_rx.get(k)
             if rx is None:
                 return Readiness.STALE                  # required type missing (never seen / dropped by disconnect)
-            if now - rx > self.max_age_by_type.get(t, self.max_age):
+            if now < rx or now - rx > self.max_age_by_type.get(t, self.max_age):
                 return Readiness.STALE
+            if t == "KLINE" and source in (Source.BINANCE_SPOT, Source.BINANCE_FUTURES):
+                if not self.kline_ready_intervals(src, symbol, now):
+                    return Readiness.STALE
         return Readiness.READY
+
+    def kline_ready_intervals(self, source: str, symbol: str, now: datetime):
+        """Intervals with an approved current CLOSED and fresh accepted WS update."""
+        return self._klines.current_intervals(source, symbol, now, self._kline_rx, self.max_age)
+
+    def approved_klines(self, source: str, symbol: str, now: datetime, lookback: timedelta):
+        allowed = self.kline_ready_intervals(source, symbol, now)
+        return [e for e in self._klines.approved(source, symbol, now, lookback)
+                if e.normalized_payload["interval"] in allowed]
 
     def _default_types(self, src: str, symbol: str):
         """Types a consumer implicitly depends on when it names none: everything seen, except that a REST
