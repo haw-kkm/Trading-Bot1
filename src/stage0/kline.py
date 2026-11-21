@@ -41,7 +41,8 @@ def fingerprint(env: MarketEnvelope) -> str:
 def close_values(env: MarketEnvelope):
     n = env.normalized_payload
     return tuple(n[k] for k in ("open", "high", "low", "close", "volume", "interval",
-                                "open_time_ms", "close_time_ms", "is_closed"))
+                                "open_time_ms", "close_time_ms", "is_closed",
+                                "trade_count", "first_trade_id", "last_trade_id") if k in n)
 
 
 def validate(env: MarketEnvelope, premature_ms: int = PREMATURE_TOLERANCE_MS,
@@ -99,6 +100,10 @@ def validate(env: MarketEnvelope, premature_ms: int = PREMATURE_TOLERANCE_MS,
                     raise EnvelopeError(f"KLINE raw {field} mismatch")
             except (KeyError, ValueError, ArithmeticError):
                 raise EnvelopeError(f"KLINE raw {field} malformed")
+    # Upper admission deadline: a very late event is retained as evidence, not
+    # admitted as a usable new final candle. Lower C bound applies at snapshot time.
+    if closed and millis(env.received_at) > start + 2 * span + GRACE_MS:
+        raise EnvelopeError("KLINE_CURRENCY_EXPIRED")
     if closed and event_ms < end - premature_ms:
         raise EnvelopeError("KLINE_PREMATURE_CLOSE")
     notices = []
