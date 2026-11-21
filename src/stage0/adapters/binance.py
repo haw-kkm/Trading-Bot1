@@ -13,6 +13,7 @@ from typing import Any, Dict, List
 from ..envelope import (EnvelopeError, EventType, MarketEnvelope, Provenance, Source, ms_to_utc,
                         to_decimal)
 from ..symbols import binance_to_common
+from ..kline import validate as validate_binance_kline
 
 
 def _env(src, futures, sym, et, event_ms, rx, raw, norm, seq=None, prov=Provenance.OBSERVED, flags=()):
@@ -98,10 +99,18 @@ class BinanceParser:
 
     def _kline(self, r, rx):
         k = r["k"]
-        return self._e(r["s"], EventType.KLINE, r.get("E"), rx, r,
-                       {"open": k["o"], "high": k["h"], "low": k["l"], "close": k["c"], "volume": k["v"],
-                        "interval": k["i"], "open_time_ms": k["t"], "close_time_ms": k["T"],
-                        "is_closed": bool(k["x"])}, seq=str(k["t"]))
+        if type(k.get("x")) is not bool:
+            raise EnvelopeError("KLINE k.x must be a JSON boolean")
+        n = {"open": k["o"], "high": k["h"], "low": k["l"], "close": k["c"], "volume": k["v"],
+             "interval": k["i"], "open_time_ms": k["t"], "close_time_ms": k["T"],
+             "is_closed": k["x"]}
+        for field, out in (("n", "trade_count"), ("f", "first_trade_id"), ("L", "last_trade_id")):
+            if field in k:
+                n[out] = k[field]
+        env = self._e(r["s"], EventType.KLINE, r.get("E"), rx, r, n,
+                      seq=None)    # k.t identifies the candle, not an individual WS update
+        validate_binance_kline(env)
+        return env
 
     def parse_price(self, raw: Dict[str, Any], received_at) -> MarketEnvelope:
         """REST /ticker/price: {"symbol","price"} (futures adds "time"). No event time on spot."""

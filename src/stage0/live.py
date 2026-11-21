@@ -376,10 +376,27 @@ class LiveRunner:
                 while self.clock().timestamp() < deadline:
                     raw = await asyncio.wait_for(conn.recv(), timeout=self.idle_timeout_s)
                     self._tick()
+                    received = self.clock()
+                    decoded = None
                     try:
-                        self._ingest_all(P.parse(json.loads(raw), self.clock()), "ws")
+                        decoded = json.loads(raw)
+                        self._ingest_all(P.parse(decoded, received), "ws")
                     except (EnvelopeError, KeyError, ValueError, TypeError) as e:
-                        self.c.reject({"error": f"{type(e).__name__}: {e}"})
+                        entry = {"error": f"{type(e).__name__}: {e}"}
+                        # Binance KLINE parse failures are evidence about our tolerance
+                        # assumptions. Store their decoded public-market payload in the
+                        # REJECTION sidecar, never in the validated Envelope JSONL.
+                        body = decoded.get("data", decoded) if isinstance(decoded, dict) else None
+                        if isinstance(body, dict) and body.get("e") == "kline":
+                            k = body.get("k")
+                            entry.update(source=src.value, channel="ws",
+                                         received_at=received.isoformat(),
+                                         event_time_ms=body.get("E"),
+                                         open_time_ms=k.get("t") if isinstance(k, dict) else None,
+                                         close_time_ms=k.get("T") if isinstance(k, dict) else None,
+                                         is_closed=k.get("x") if isinstance(k, dict) else None,
+                                         raw_message=decoded)
+                        self.c.reject(entry)
                     b = self.c.books.get((src, common)) if with_book else None
                     if b is not None and b.state == BookState.INVALID:
                         self.resyncs += 1
@@ -765,6 +782,21 @@ class JsonlSink:
         return {"lines": self.lines, "sha256": self._h.hexdigest()}
 
 
+class RejectedJsonlSink(JsonlSink):
+    """Separate JSONL for *rejected* public Binance KLINEs, never fed to Stage 1.
+
+    This sidecar is not an Envelope file: invalid market messages cannot pass
+    the validated-envelope serialization contract. It has its own SHA-256 and
+    line-count attestation, and writes happen before in-memory rejection eviction.
+    """
+
+    def __call__(self, entry):
+        line = json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
+        self._fh.write(line)
+        self._h.update(line.encode("utf-8"))
+        self.lines += 1
+
+
 # In-memory retention for a live run: the JSONL sink is the evidence, memory only keeps a recent window.
 LIVE_MAX_ENVELOPES, LIVE_MAX_REJECTED = 2_000, 2_000
 
@@ -808,7 +840,10 @@ def main(argv=None) -> int:
         print(json.dumps(out, indent=2))
         return 1 if counts.get(FAIL) else 0          # the REST contract only: extended evidence never changes it
     sink = JsonlSink(args.out) if args.out else None
-    col = Collector(max_envelopes=LIVE_MAX_ENVELOPES, max_rejected=LIVE_MAX_REJECTED, sink=sink)
+    rejected_sink = (RejectedJsonlSink(str(args.out) + ".rejected.jsonl")
+                     if args.out and src in (Source.BINANCE_SPOT, Source.BINANCE_FUTURES) else None)
+    col = Collector(max_envelopes=LIVE_MAX_ENVELOPES, max_rejected=LIVE_MAX_REJECTED,
+                    sink=sink, rejected_sink=rejected_sink)
     runner = LiveRunner(col, rest, PublicWsClient(pol))
     code, reasons, err = EXIT_OK, [], None
     try:
@@ -825,6 +860,7 @@ def main(argv=None) -> int:
     except Exception as e:                                  # internal error: never report as success
         code, err = EXIT_INTEGRITY, f"internal error: {type(e).__name__}"
     written = sink.close() if sink else None
+    rejected_written = rejected_sink.close() if rejected_sink else None
     common = toobit_to_common(args.symbol) if src == Source.TOOBIT_FUTURES else binance_to_common(
         args.symbol, src == Source.BINANCE_FUTURES)
     print(json.dumps({"exit_code": code, "error": err, "unhealthy_reasons": reasons,
@@ -835,6 +871,9 @@ def main(argv=None) -> int:
                       "rejected_by_error": dict(Counter(r["error"][:120] for r in col.rejected)),
                       "end_of_collection": runner.end_state, "stream_freshness": runner.stream_report(),
                       "events_file_written": written,
+                      "rejected_kline_file_written": (
+                          {"path": str(args.out) + ".rejected.jsonl", **rejected_written}
+                          if rejected_written is not None else None),
                       "rest_failures": runner.rest_failures, "max_gap_s": round(runner.max_gap_s, 1),
                       }, indent=2))
     if err:

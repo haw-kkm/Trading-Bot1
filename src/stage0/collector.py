@@ -181,13 +181,16 @@ class Collector:
     max_envelopes: Optional[int] = None
     max_rejected: Optional[int] = None
     sink: Optional[Callable[[MarketEnvelope], None]] = None
+    rejected_sink: Optional[Callable[[dict], None]] = None  # durable raw rejection evidence
     envelope_count: int = 0
     rejected_count: int = 0
     books: Dict[tuple, LocalOrderBook] = field(default_factory=dict)
     network_calls: int = 0           # real network requests made by THIS object (always 0 in FIXTURE)
 
     def reject(self, entry: dict):
-        """Quarantine an unparsable message (never used as data)."""
+        """Quarantine a rejected message; persist evidence before bounded-memory eviction."""
+        if self.rejected_sink is not None and "raw_message" in entry:
+            self.rejected_sink(entry)
         self.rejected_count += 1
         self.rejected.append(entry)
         if self.max_rejected is not None and len(self.rejected) > self.max_rejected:

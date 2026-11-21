@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from ...stage0.envelope import MarketEnvelope
+from ...stage0.envelope import EventType, MarketEnvelope
 from ..quality_policy import event_instant
 
 ZERO = Decimal(0)
@@ -115,14 +115,43 @@ def _interval_seconds(label: str) -> Optional[int]:
 
 
 def bars_from_klines(klines: Sequence[MarketEnvelope]) -> Optional[BarSeries]:
-    """Exchange candles. Only CLOSED bars (is_closed True) count; a feed that does not say whether a bar
-    is closed (Toobit) loses its newest bar per interval (it may still be forming)."""
+    """Select immutable valid CLOSED bars; a delayed OPEN cannot overwrite them.
+
+    Binance input undergoes the same per-envelope defensive validation as the Stage 0
+    parser (manual/JSONL construction is no bypass). Conflicting finalized values
+    exclude the bar. Toobit candles without an explicit closed flag retain the
+    legacy policy: drop the newest potentially forming bar.
+    """
+    from ...stage0.kline import close_values, validate as validate_binance
+    from ...stage0.envelope import EnvelopeError, Source
     by_iv: Dict[str, Dict[int, Tuple[MarketEnvelope, dict]]] = {}
+    conflict = set()
     for e in klines:
+        if e.event_type != EventType.KLINE:
+            continue
         n = e.normalized_payload
+        if e.source in (Source.BINANCE_SPOT, Source.BINANCE_FUTURES):
+            try:
+                validate_binance(e)
+            except (EnvelopeError, KeyError, TypeError):
+                continue
         t0 = n.get("open_time_ms")
         key = int(t0) if t0 is not None else int(event_instant(e).timestamp() * 1000)
-        by_iv.setdefault(n["interval"], {})[key] = (e, n)          # last update of a bar wins
+        iv = n["interval"]
+        previous = by_iv.setdefault(iv, {}).get(key)
+        if (iv, key) in conflict:
+            continue
+        if "is_closed" in n:
+            if n["is_closed"] is not True:
+                if previous is None:
+                    by_iv[iv][key] = (e, n)
+                continue
+            if previous and previous[1].get("is_closed") is True:
+                if close_values(previous[0]) != close_values(e):
+                    conflict.add((iv, key))
+                    by_iv[iv].pop(key, None)
+                continue
+        by_iv[iv][key] = (e, n)
     best = None
     for iv, rows in by_iv.items():
         items = sorted(rows.items())
