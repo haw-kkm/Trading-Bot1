@@ -15,6 +15,7 @@ from typing import Dict, Iterable, List, Optional
 
 from ..stage0.envelope import EnvelopeError, EventType, MarketEnvelope, utc
 from ..stage0.quality import DataQualityGate, Readiness
+from ..stage0.kline import KlineStore, MAX_CANDLES_PER_KEY
 from . import quality_policy as policy
 from .models import _GATE_TOKEN, AgentInput, Stage0Context, Stage1Error
 
@@ -67,7 +68,13 @@ class GatedDataAccess:
             except ValueError:
                 raise Stage1Error(f"unknown event type {t!r}")
         types = sorted(set(types))
-        gate = DataQualityGate(**self._gate_kwargs)
+        kwargs = dict(self._gate_kwargs)
+        kwargs.setdefault("kline_lookback", lookback)
+        cap = kwargs.get("max_candles_per_key", MAX_CANDLES_PER_KEY)
+        kline_supported = KlineStore.supported_lookback(lookback, cap)
+        if not kline_supported:
+            kwargs["kline_lookback"] = timedelta(hours=1)
+        gate = DataQualityGate(**kwargs)
         if connected:
             gate.on_connect(src)
         else:
@@ -81,7 +88,14 @@ class GatedDataAccess:
             if env.source != src or env.symbol != symbol:
                 continue
             problem = policy.event_problem(env, src, symbol)
-            gate.observe(env)                             # the gate sees everything, incl. flagged events
+            issues = gate.observe(env)                    # the gate sees everything, incl. flagged events
+            if env.event_type == EventType.KLINE and env.source.value.startswith("binance"):
+                for issue in issues:
+                    if issue in {"KLINE_INVALID", "KLINE_NOT_SUPPORTED", "KLINE_PREMATURE_CLOSE",
+                                 "KLINE_CONFLICT", "KLINE_SUSPECT", "KLINE_NONMONOTONE_COUNT",
+                                 "KLINE_E_TIE_AMBIGUOUS"}:
+                        if "KLINE" in types:
+                            quarantined.append(f"KLINE {env.digest[:12]}: {issue}")
             if problem is not None:
                 if env.event_type.value in types:
                     quarantined.append(f"{env.event_type.value} {env.digest[:12]}: {problem}")
@@ -89,9 +103,13 @@ class GatedDataAccess:
             t = env.event_type.value
             if t not in types or not gate.is_current(env):
                 continue
+            if t == "KLINE" and env.source.value.startswith("binance"):
+                continue      # build after replay from FINAL per-bar states, never from transient revisions
             if policy.event_instant(env) > now or policy.event_instant(env) < start:
                 continue                                  # future (leak) or outside the analysis window
             history[t].append(env)
+        if "KLINE" in types and src.value.startswith("binance") and kline_supported:
+            history["KLINE"] = gate.approved_klines(src.value, symbol, now, lookback)
         readiness: Dict[str, str] = {}
         diagnosis: Dict[str, str] = {}
         events: Dict[str, tuple] = {}
@@ -99,7 +117,14 @@ class GatedDataAccess:
             st = gate.status(src, symbol, now, types=[t])
             readiness[t] = st.value
             diagnosis[t] = gate.explain(src, symbol, now, types=[t]).get(t, "")
-            if st == Readiness.READY:
+            if t == "KLINE" and src.value.startswith("binance"):
+                if not kline_supported:
+                    readiness[t] = Readiness.INVALID.value
+                    diagnosis[t] = "KLINE_LOOKBACK_NOT_SUPPORTED: exceeds bounded 256-candle budget"
+                    continue
+                if readiness[t] == Readiness.STALE.value and not gate.kline_ready_intervals(src.value, symbol, now):
+                    diagnosis[t] = "no current CLOSED and fresh per-interval KLINE observation"
+            if readiness[t] == Readiness.READY.value:
                 events[t] = tuple(history.get(t, ()))
         # an event type whose events were all quarantined is not READY even if the gate saw clean ones
         for t in types:
