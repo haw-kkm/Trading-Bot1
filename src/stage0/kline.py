@@ -232,25 +232,39 @@ class KlineStore:
         return sorted(out, key=lambda e: (e.normalized_payload["interval"],
                                           e.normalized_payload["open_time_ms"]))
 
-    def current_closed(self, source: str, symbol: str, now: datetime) -> bool:
+    def current_intervals(self, source: str, symbol: str, now: datetime,
+                          rx_by_interval: dict, max_age: timedelta):
+        """Currency C applies to the newest APPROVED CLOSED, never every historical candle.
+
+        A newer ambiguous/suspect bar cannot leave stale earlier candles silently READY.
+        The freshness check is separate for 1m and 5m streams.
+        """
         now_ms = millis(now)
+        ok = set()
         intervals = {(k[2], k[3]) for k in self.rows if k[0] == source and k[1] == symbol}
         for xs, iv in intervals:
+            rx = rx_by_interval.get((source, symbol, iv))
+            if rx is None or now < rx or now - rx > max_age:
+                continue
             rows = [(k[-1], c) for k, c in self.rows.items()
                     if k[0] == source and k[1] == symbol and k[2] == xs and k[3] == iv]
             if not rows:
                 continue
-            newest_open, newest = max(rows, key=lambda t: t[0])
-            if newest.state in ("SUSPECT", "CONFLICT"):
+            _, newest = max(rows, key=lambda t: t[0])
+            if newest.state in ("SUSPECT", "CONFLICT") or newest.ambiguous_e is not None:
                 continue
             closed = [(op, c) for op, c in rows if c.state == "CLOSED"]
             if not closed:
                 continue
-            start, candle = max(closed, key=lambda t: t[0])
+            start, _ = max(closed, key=lambda t: t[0])
             span = INTERVAL_MS[iv]
             if start + span <= now_ms <= start + 2 * span + self.grace_ms:
-                return True
-        return False
+                ok.add(iv)
+        return ok
+
+    def current_closed(self, source: str, symbol: str, now: datetime) -> bool:
+        rx_by_interval = {(k[0], k[1], k[3]): now for k in self.rows}
+        return bool(self.current_intervals(source, symbol, now, rx_by_interval, timedelta(seconds=10)))
 
     @staticmethod
     def supported_lookback(lookback: timedelta, cap: int = MAX_CANDLES_PER_KEY) -> bool:
