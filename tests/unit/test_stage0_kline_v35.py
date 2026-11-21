@@ -126,11 +126,18 @@ def test_conflicting_closes_quarantine_historical_candle():
     now = ev[-1].received_at + timedelta(seconds=1)
     first = GatedDataAccess(ev).snapshot(SRC.value, SYM, now, ["KLINE"])
     assert len(first.events["KLINE"]) == 25
-    changed = kline(5, closed=True, revision=3, close="102", rx_ms=millis(ev[-1].received_at)+100)
-    second = GatedDataAccess(ev + [changed]).snapshot(SRC.value, SYM, now + timedelta(seconds=2), ["KLINE"])
+    # The conflicting close is observed within bar 23's C upper bound; its exchange E
+    # is late but locally fresh. A hypothetical conflict 20 minutes later would fail C.
+    last_rx = millis(ev[-1].received_at)
+    changed = kline(23, closed=True, revision=3, close="102",
+                    event_ms=last_rx+100, rx_ms=last_rx+200)
+    second = GatedDataAccess(ev + [changed]).snapshot(
+        SRC.value, SYM, dt(last_rx+1000), ["KLINE"])
     assert len(second.events["KLINE"]) == 24
-    assert 5 not in [(e.normalized_payload["open_time_ms"] - START)//60000 for e in second.events["KLINE"]]
-    old_again = GatedDataAccess(ev + [changed]).snapshot(SRC.value, SYM, now, ["KLINE"])
+    assert 23 not in [(e.normalized_payload["open_time_ms"] - START)//60000
+                      for e in second.events["KLINE"]]
+    old_again = GatedDataAccess(ev + [changed]).snapshot(
+        SRC.value, SYM, dt(last_rx+100), ["KLINE"])
     assert len(old_again.events["KLINE"]) == 25
 
 
